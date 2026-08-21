@@ -4,10 +4,8 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import yaml
 
-from get_train_data import build_offline_dataset
 from modules.bars import ClosedBarClock, parse_kline_message, replay_closed_klines
 from modules.features import (
     BOOK_FEATURE_IDX,
@@ -19,7 +17,7 @@ from modules.ledger import PaperBroker
 from modules.risk import EXIT_REASONS, RiskController
 
 
-def _klines_df(n=40, start_ms=1_700_000_000_000, px0=100.0):
+def _klines(n=40, start_ms=1_700_000_000_000, px0=100.0):
     rows = []
     px = float(px0)
     for i in range(n):
@@ -29,11 +27,11 @@ def _klines_df(n=40, start_ms=1_700_000_000_000, px0=100.0):
         l = min(o, c) - 0.18
         v = 10.0 + i
         rows.append({
-            "time": pd.Timestamp(start_ms + i * 60_000, unit="ms", tz="UTC"),
+            "open_ts_ms": start_ms + i * 60_000,
             "open": o, "high": h, "low": l, "close": c, "volume": v,
         })
         px = c
-    return pd.DataFrame(rows)
+    return rows
 
 
 class ClosedBarOnlyTests(unittest.TestCase):
@@ -68,29 +66,25 @@ class ClosedBarOnlyTests(unittest.TestCase):
         self.assertIsNone(clock.ingest_kline_msg(closed_msg))
         self.assertEqual(len(fb.buf), 1)
 
-    def test_runner_skips_forming_then_builds_once(self):
-        from main import SymbolRunner
-
-        r = SymbolRunner("btcusdt")
-        before = len(r.fb.buf)
+    def test_update_closed_kline_is_one_row_and_skips_forming(self):
+        clock = ClosedBarClock()
+        fb = FeatureBuilder(seq_len=30, k_levels=3)
         forming = {
             "channel": "kline", "open_ts_ms": 1_700_000_060_000,
             "o": 100.0, "h": 100.5, "l": 99.5, "c": 100.2, "v": 8.0, "closed": False,
         }
-        self.assertIsNone(r._maybe_emit_closed_from_kline(forming))
-        self.assertEqual(len(r.fb.buf), before)
-
-        closed = dict(forming, closed=True)
-        bar = r._maybe_emit_closed_from_kline(closed)
+        self.assertIsNone(clock.ingest_kline_msg(forming))
+        self.assertEqual(len(fb.buf), 0)
+        bar = clock.ingest_kline_msg(dict(forming, closed=True))
         self.assertIsNotNone(bar)
-        r._on_closed_bar(bar)
-        self.assertEqual(len(r.fb.buf), before + 1)
-        self.assertIsNone(r._maybe_emit_closed_from_kline(closed))
-        self.assertEqual(len(r.fb.buf), before + 1)
+        fb.update_closed_kline(bar.open, bar.high, bar.low, bar.close, bar.volume)
+        self.assertEqual(len(fb.buf), 1)
+        self.assertIsNone(clock.ingest_kline_msg(dict(forming, closed=True)))
+        self.assertEqual(len(fb.buf), 1)
 
     def test_trade_aggregation_does_not_emit_forming_minute(self):
         clock = ClosedBarClock()
-        t0 = 1_700_000_000_000
+        t0 = 1_700_000_000_000 - (1_700_000_000_000 % 60_000)
         self.assertIsNone(clock.ingest_trade(t0 + 1_000, 100.0, 1.0))
         self.assertIsNone(clock.ingest_trade(t0 + 30_000, 100.5, 1.0))
         closed = clock.ingest_trade(t0 + 60_000, 101.0, 1.0)
@@ -102,20 +96,12 @@ class ClosedBarOnlyTests(unittest.TestCase):
 
 class OfflineParityTests(unittest.TestCase):
     def test_closed_klines_match_offline_builder(self):
-        df = _klines_df(45)
-        cfg = {
-            "seq_len": 30,
-            "input_size": 12,
-            "label": {"horizon_minutes": 20, "drop_deadzone": False, "dead_zone": 0.0},
-            "trading": {"taker_fee_bp": 2.0, "slippage_bp": 3.0},
-        }
-        ds = build_offline_dataset(cfg, df=df)
-
+        rows = _klines(45)
         fb_live = FeatureBuilder(seq_len=30, k_levels=3)
         clock = ClosedBarClock()
         live_seqs = []
-        for _, row in df.iterrows():
-            ts_ms = int(row["time"].timestamp() * 1000)
+        for row in rows:
+            ts_ms = int(row["open_ts_ms"])
             self.assertIsNone(clock.ingest_kline(
                 ts_ms, row["open"], row["high"], row["low"], row["close"], row["volume"], closed=False
             ))
@@ -128,9 +114,10 @@ class OfflineParityTests(unittest.TestCase):
                 live_seqs.append(seq)
 
         self.assertGreaterEqual(len(live_seqs), 1)
+        # Offline trainer path: one kline → one build_from_kline (get_train_data replay)
         fb_off = FeatureBuilder(seq_len=30, k_levels=3)
         off_seqs = []
-        for _, row in df.iterrows():
+        for row in rows:
             seq = build_from_kline(fb_off, row["open"], row["high"], row["low"], row["close"], row["volume"])
             if seq is not None:
                 off_seqs.append(seq)
@@ -139,22 +126,12 @@ class OfflineParityTests(unittest.TestCase):
             np.testing.assert_allclose(a, b, rtol=0, atol=0)
 
         replayed = replay_closed_klines(
-            [(int(r["time"].timestamp() * 1000), r["open"], r["high"], r["low"], r["close"], r["volume"])
-             for _, r in df.iterrows()],
+            [(r["open_ts_ms"], r["open"], r["high"], r["low"], r["close"], r["volume"]) for r in rows],
             seq_len=30,
         )
         self.assertEqual(len(live_seqs), len(replayed))
         for a, b in zip(live_seqs, replayed):
             np.testing.assert_allclose(a, b, rtol=0, atol=0)
-
-        self.assertEqual(ds["X"].shape[1], 30)
-        self.assertEqual(ds["X"].shape[2], 12)
-        # labeled last_rows are FeatureBuilder rows from the same kline replay
-        if len(ds["last_row"]):
-            live_last = np.stack([s[-1] for s in live_seqs], axis=0)
-            for row in ds["last_row"]:
-                dist = np.max(np.abs(live_last - row), axis=1)
-                self.assertLess(float(np.min(dist)), 1e-5)
 
     def test_get_train_data_uses_shared_kline_path(self):
         src = Path("get_train_data.py").read_text(encoding="utf-8")

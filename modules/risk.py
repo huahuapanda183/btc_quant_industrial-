@@ -346,6 +346,11 @@ class RiskController:
             if self.entry_time and (now - self.entry_time) >= self.future_holding * 60:
                 return self._emit_exit("BUY", "timeout")
 
+        # Frozen: p must not size or flip. Exits already returned above.
+        if not self.allow_new_opens:
+            if signal != "HOLD" and signal != self.position:
+                return "HOLD", "opens_frozen"
+
         # ===== 反手护栏：持仓后 N 秒内禁止反手（MM 可选择绕过）=====
         if self.position in ("BUY", "SELL") and signal in ("BUY", "SELL") and signal != self.position:
             if not (is_mm and self.mm_bypass_reverse_guard):
@@ -365,8 +370,6 @@ class RiskController:
 
         # ===== 新开仓 / 反手（只决策，账本由 PaperBroker 平后开）=====
         if signal != "HOLD" and signal != self.position:
-            if not self.allow_new_opens:
-                return "HOLD", "opens_frozen"
             return signal, "open"
 
         return "HOLD", "no_change"
