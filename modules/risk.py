@@ -9,7 +9,12 @@ import pickle
 import time
 import numpy as np
 import os
-from typing import Tuple, Union, Dict, Any
+from typing import Tuple, Union, Dict, Any, Callable, Optional
+
+
+EXIT_REASONS = {
+    "take_profit", "stop_loss", "trail_take", "timeout", "breakeven", "fast_take"
+}
 
 
 class RiskController:
@@ -23,9 +28,12 @@ class RiskController:
       - 在调用 judge 时，将 SignalFusion 的诊断字符串传入 price_data["reason_text"]
         （当包含 "mm_gate" 时视为做市直通信号）
       - 可传 price_data["cooldown_release"]=True 以在冷却期内事件化放行
+      - 纸面交易必须注入 position_view（读 PaperBroker）。judge 只做决策，
+        不改账本；反手/平仓都等 fill 之后才与账本对齐。
     """
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, position_view: Optional[Callable[[], Dict[str, Any]]] = None):
         self.symbol = symbol.lower()
+        self.position_view = position_view
         self.position = "HOLD"
         self.last_price: Union[float, None] = None
         self.last_trade_time: float = 0.0
@@ -77,6 +85,9 @@ class RiskController:
         self._breakeven_armed = False
 
         self.state_path = f"{self.symbol}_risk.pkl"
+        self._pending_exit = None  # (decision, reason) until the ledger fill lands
+        self._book_side = None
+        self._book_entry_time = None
         self.load_state()
 
     # ========= 状态持久化 =========
@@ -86,10 +97,12 @@ class RiskController:
         try:
             data = pickle.load(open(self.state_path, "rb"))
             if isinstance(data, dict):
-                self.position = data.get("position", "HOLD")
-                self.last_price = data.get("last_price", None)
+                # When a ledger view is bound, pickle is not the fill book.
+                if self.position_view is None:
+                    self.position = data.get("position", "HOLD")
+                    self.last_price = data.get("last_price", None)
+                    self.entry_time = data.get("entry_time", 0.0)
                 self.last_trade_time = data.get("last_trade_time", 0.0)
-                self.entry_time = data.get("entry_time", 0.0)
                 self._peak = data.get("peak", None)
                 self._trough = data.get("trough", None)
                 self._breakeven_armed = data.get("breakeven_armed", False)
@@ -104,16 +117,89 @@ class RiskController:
 
     def save_state(self):
         state = {
-            "position": self.position,
-            "last_price": self.last_price,
+            "position": self.position if self.position_view is None else "HOLD",
+            "last_price": self.last_price if self.position_view is None else None,
             "last_trade_time": self.last_trade_time,
-            "entry_time": self.entry_time,
+            "entry_time": self.entry_time if self.position_view is None else 0.0,
             "peak": self._peak,
             "trough": self._trough,
             "breakeven_armed": self._breakeven_armed
         }
         with open(self.state_path, "wb") as f:
             pickle.dump(state, f)
+
+    def _normalize_side(self, side: Any) -> str:
+        s = str(side or "HOLD").upper()
+        if s in ("BUY", "LONG"):
+            return "BUY"
+        if s in ("SELL", "SHORT"):
+            return "SELL"
+        return "HOLD"
+
+    def _sync_from_ledger(self):
+        """Copy the authoritative book into local snapshot fields. No fills."""
+        if self.position_view is None:
+            return
+        try:
+            snap = self.position_view() or {}
+        except Exception:
+            return
+        side = self._normalize_side(snap.get("side", "HOLD"))
+        entry = float(snap.get("entry") or 0.0) or None
+        entry_time = float(snap.get("entry_time") or 0.0)
+        if side != self._book_side or entry_time != self._book_entry_time:
+            self._book_side = side
+            self._book_entry_time = entry_time
+            if side == "BUY":
+                self._peak = entry
+                self._trough = None
+                self._breakeven_armed = False
+            elif side == "SELL":
+                self._trough = entry
+                self._peak = None
+                self._breakeven_armed = False
+            else:
+                self._peak = self._trough = None
+                self._breakeven_armed = False
+                self._pending_exit = None
+        self.position = side
+        self.last_price = entry if side in ("BUY", "SELL") else None
+        self.entry_time = entry_time if side in ("BUY", "SELL") else 0.0
+
+    def in_position(self) -> bool:
+        self._sync_from_ledger()
+        return self.position in ("BUY", "SELL")
+
+    def on_fill(self, decision: str, reason: str, price: float, exec_resp: Optional[Dict[str, Any]] = None):
+        """Update tracking after a PaperBroker fill. Does not write the book."""
+        self.last_trade_time = time.time()
+        events = []
+        if exec_resp:
+            events = list(exec_resp.get("events") or [])
+            if exec_resp.get("event"):
+                events.append(str(exec_resp.get("event")))
+        ev_join = " ".join(str(e) for e in events)
+        if reason in EXIT_REASONS or "CLOSE" in ev_join:
+            self._pending_exit = None
+            if self.position_view is None:
+                self._reset_position()
+            else:
+                self._peak = self._trough = None
+                self._breakeven_armed = False
+        if reason == "open" or "OPEN" in ev_join or "REVERSE" in ev_join:
+            self._pending_exit = None
+            self.entry_time = time.time()
+            if decision == "BUY":
+                self._peak = float(price)
+                self._trough = None
+            elif decision == "SELL":
+                self._trough = float(price)
+                self._peak = None
+            self._breakeven_armed = False
+            if self.position_view is None:
+                self.position = decision
+                self.last_price = float(price)
+        self.save_state()
 
     # ========= 工具 =========
     @staticmethod
@@ -146,6 +232,7 @@ class RiskController:
           - 'reason_text'（可选）传入 SignalFusion 的 diag；含 "mm_gate" 视为 MM 直通
           - 'cooldown_release'（可选）冷却内事件放行
         """
+        self._sync_from_ledger()
         p = float(price_data.get("p", price_data.get("price", 0.0)))
         closes = price_data.get("close", None)
         reason_text = price_data.get("reason_text", "")
@@ -153,6 +240,9 @@ class RiskController:
 
         atr_pct = self._atr_pct_from_close(closes)
         now = time.time()
+        if self._pending_exit and self.position in ("BUY", "SELL"):
+            # still waiting for the reduce-only fill; re-issue the same exit
+            return self._pending_exit
 
         # 冷却期：不允许新开/反手（MM 可选择绕过；或事件释放）
         in_cooldown = (now - self.last_trade_time) < self.cooldown_seconds
@@ -184,33 +274,27 @@ class RiskController:
             # 快速止盈：N 分钟内达到多倍 ATR 直接走
             if self.fast_tp_enable and self.entry_time and (now - self.entry_time) <= self.fast_tp_window_min * 60:
                 if ret >= self.fast_tp_mult * atr_pct:
-                    self._reset_position()
-                    return "SELL", "fast_take"
+                    return self._emit_exit("SELL", "fast_take")
 
             # 常规 TP
             if ret >= TP:
-                self._reset_position()
-                return "SELL", "take_profit"
+                return self._emit_exit("SELL", "take_profit")
 
             # 止损 / 保本触发
             if self._breakeven_armed:
                 if ret <= 0.0 + self.eps:
-                    self._reset_position()
-                    return "SELL", "breakeven"
+                    return self._emit_exit("SELL", "breakeven")
             else:
                 if ret <= -SL:
-                    self._reset_position()
-                    return "SELL", "stop_loss"
+                    return self._emit_exit("SELL", "stop_loss")
 
             # 追踪止盈
             if self._peak and (self._peak - p) / max(self._peak, 1e-12) >= trail_dyn:
-                self._reset_position()
-                return "SELL", "trail_take"
+                return self._emit_exit("SELL", "trail_take")
 
             # 时间平仓
             if self.entry_time and (now - self.entry_time) >= self.future_holding * 60:
-                self._reset_position()
-                return "SELL", "timeout"
+                return self._emit_exit("SELL", "timeout")
 
         elif self.position == "SELL" and self.last_price:
             ret = (self.last_price - p) / max(self.last_price, 1e-12)
@@ -223,33 +307,27 @@ class RiskController:
             # 快速止盈
             if self.fast_tp_enable and self.entry_time and (now - self.entry_time) <= self.fast_tp_window_min * 60:
                 if ret >= self.fast_tp_mult * atr_pct:
-                    self._reset_position()
-                    return "BUY", "fast_take"
+                    return self._emit_exit("BUY", "fast_take")
 
             # 常规 TP
             if ret >= TP:
-                self._reset_position()
-                return "BUY", "take_profit"
+                return self._emit_exit("BUY", "take_profit")
 
             # 止损 / 保本触发（空头）
             if self._breakeven_armed:
                 if ret <= 0.0 + self.eps:
-                    self._reset_position()
-                    return "BUY", "breakeven"
+                    return self._emit_exit("BUY", "breakeven")
             else:
                 if ret <= -SL:
-                    self._reset_position()
-                    return "BUY", "stop_loss"
+                    return self._emit_exit("BUY", "stop_loss")
 
             # 追踪止盈（空头）
             if self._trough and (p - self._trough) / max(self._trough, 1e-12) >= trail_dyn:
-                self._reset_position()
-                return "BUY", "trail_take"
+                return self._emit_exit("BUY", "trail_take")
 
             # 时间平仓
             if self.entry_time and (now - self.entry_time) >= self.future_holding * 60:
-                self._reset_position()
-                return "BUY", "timeout"
+                return self._emit_exit("BUY", "timeout")
 
         # ===== 反手护栏：持仓后 N 秒内禁止反手（MM 可选择绕过）=====
         if self.position in ("BUY", "SELL") and signal in ("BUY", "SELL") and signal != self.position:
@@ -268,25 +346,37 @@ class RiskController:
                 if abs(p - self.last_price) < band:
                     return "HOLD", "min_move"
 
-        # ===== 新开仓 =====
+        # ===== 新开仓 / 反手（只决策，账本由 PaperBroker 平后开）=====
         if signal != "HOLD" and signal != self.position:
-            self.position = signal
-            self.last_price = p
-            self.last_trade_time = now
-            self.entry_time = now
-            self._peak = p if signal == "BUY" else None
-            self._trough = p if signal == "SELL" else None
-            self._breakeven_armed = False
-            self.save_state()
+            if self.position_view is None:
+                # isolated / no ledger: keep legacy local book so unit tests work
+                self.position = signal
+                self.last_price = p
+                self.last_trade_time = now
+                self.entry_time = now
+                self._peak = p if signal == "BUY" else None
+                self._trough = p if signal == "SELL" else None
+                self._breakeven_armed = False
+                self.save_state()
             return signal, "open"
 
         return "HOLD", "no_change"
 
+    def _emit_exit(self, decision: str, reason: str):
+        if self.position_view is None:
+            self._reset_position()
+        else:
+            self._pending_exit = (decision, reason)
+            self.save_state()
+        return decision, reason
+
     def _reset_position(self):
+        """Local-only flatten. Must not be the paper fill."""
         self.position = "HOLD"
         self.last_price = None
         self.last_trade_time = time.time()
         self.entry_time = 0.0
         self._peak, self._trough = None, None
         self._breakeven_armed = False
+        self._pending_exit = None
         self.save_state()

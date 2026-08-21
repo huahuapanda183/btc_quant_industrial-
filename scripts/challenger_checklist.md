@@ -7,6 +7,7 @@
 - [ ] 是否出现参数连续漂移（最近6次优化）
 - [ ] 是否出现执行层限流过高（exec_skip:rate_limited）
 - [ ] 是否出现风控过冷（mm_block:cooldown、risk_gate:cooldown异常高）
+- [ ] avg_prob≈0.5 时：是否已重训分类头？温度是否在持出验证段拟合？还是旧 MSE+sigmoid 权重？
 
 输出建议：
 1) 本轮最可疑指标

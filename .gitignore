@@ -194,6 +194,16 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Local model / dataset artifacts (do not commit weights)
+scaler.pkl
+tft_model.pth
+nbeats_model.pth
+model_meta.json
+train_data.csv
+train_data.npz
+*_risk.pkl
+logs/
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data

@@ -1,162 +1,11 @@
 # modules/executor.py
 import time
 import threading
-import json
-from pathlib import Path
 from collections import deque, defaultdict
 
+from modules.ledger import PaperBroker
+
 __all__ = ["TradeExecutor", "PaperBroker"]
-
-
-class PaperBroker:
-    """
-    极简纸面撮合：
-    - 若提供 best bid/ask，用近似真实的吃单价成交（买按 ask，卖按 bid）
-    - 否则退化为用 last price 并叠加滑点基点（可自适应 spread）
-    - 维护持仓/权益/当日回撤
-    """
-    def __init__(self, journal_path: str = "logs/paper_trades.jsonl"):
-        self.position = defaultdict(lambda: {"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
-        self.equity = 100000.0
-        self.daily_eq_hi = self.equity
-        self.daily_eq_lo = self.equity
-        self.trades = []
-        self.day = time.strftime("%Y-%m-%d")
-        self.journal_path = Path(journal_path)
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _roll_day(self):
-        d = time.strftime("%Y-%m-%d")
-        if d != self.day:
-            self.day = d
-            self.daily_eq_hi = self.equity
-            self.daily_eq_lo = self.equity
-
-    def equity_drawdown_bp(self):
-        self._roll_day()
-        if self.daily_eq_hi <= 0:
-            return 0.0
-        dd = (self.daily_eq_hi - self.equity) / self.daily_eq_hi
-        return max(0.0, dd) * 10000.0
-
-    def mark_to_market(self, sym: str, price: float) -> float:
-        pos = self.position[sym]
-        if pos["side"] == "LONG":
-            return (price - pos["entry"]) * pos["qty"]
-        if pos["side"] == "SHORT":
-            return (pos["entry"] - price) * pos["qty"]
-        return 0.0
-
-    def _update_daily_extrema(self):
-        self.daily_eq_hi = max(self.daily_eq_hi, self.equity)
-        self.daily_eq_lo = min(self.daily_eq_lo, self.equity)
-
-    def _append_journal(self, rec: dict):
-        try:
-            with self.journal_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-    def _fill_price_with_slippage(self, side: str, last_px: float,
-                                  best_bid: float, best_ask: float,
-                                  slippage_bp: float):
-        """
-        有盘口：买吃 ask，卖吃 bid；无盘口：last_px*(1±slippage_bp)
-        """
-        if best_bid and best_ask and best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
-            return best_ask if side == "BUY" else best_bid
-        # fallback：仅 last
-        if last_px <= 0:
-            return 0.0
-        slip = slippage_bp / 10000.0
-        return last_px * (1.0 + slip if side == "BUY" else 1.0 - slip)
-
-    def place(self, sym: str, side: str, last_px: float, notional_quote: float,
-              best_bid: float = None, best_ask: float = None, reduce_only: bool = False,
-              slippage_bp: float = 5.0, taker_fee_bp: float = 0.0, reason: str = ""):
-        """返回 {status, price, qty, equity, event, pnl?}；pnl 为净值(含手续费)"""
-        self._roll_day()
-        ts = time.time()
-        px = float(self._fill_price_with_slippage(side, last_px, best_bid, best_ask, slippage_bp))
-        if px <= 0:
-            return {"status": "ERR", "info": "bad_price"}
-
-        qty = max(0.0001, notional_quote / px)
-        pos = self.position[sym]
-        event = "OPEN"
-        pnl = 0.0
-        pnl_gross = 0.0
-        fee_open = 0.0
-        fee_close = 0.0
-
-        if side == "BUY":
-            if pos["side"] == "SHORT" and reduce_only:
-                event = "CLOSE_SHORT"
-                close_qty = min(pos["qty"], qty)
-                pnl_gross = (pos["entry"] - px) * close_qty
-                fee_close = px * close_qty * (taker_fee_bp / 10000.0)
-                fee_open = float(pos.get("entry_fee", 0.0))
-                pnl = pnl_gross - fee_open - fee_close
-                # equity: 开仓手续费已在开仓时扣除，此处只加 gross-close_fee
-                self.equity += (pnl_gross - fee_close)
-                pos["qty"] -= close_qty
-                if pos["qty"] <= 1e-10:
-                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
-            else:
-                pos["side"] = "LONG"
-                pos["qty"] = qty
-                pos["entry"] = px
-                fee_open = px * qty * (taker_fee_bp / 10000.0)
-                pos["entry_fee"] = fee_open
-                self.equity -= fee_open
-                pnl = -fee_open
-                event = "OPEN_LONG"
-
-        elif side == "SELL":
-            if pos["side"] == "LONG" and reduce_only:
-                event = "CLOSE_LONG"
-                close_qty = min(pos["qty"], qty)
-                pnl_gross = (px - pos["entry"]) * close_qty
-                fee_close = px * close_qty * (taker_fee_bp / 10000.0)
-                fee_open = float(pos.get("entry_fee", 0.0))
-                pnl = pnl_gross - fee_open - fee_close
-                self.equity += (pnl_gross - fee_close)
-                pos["qty"] -= close_qty
-                if pos["qty"] <= 1e-10:
-                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
-            else:
-                pos["side"] = "SHORT"
-                pos["qty"] = qty
-                pos["entry"] = px
-                fee_open = px * qty * (taker_fee_bp / 10000.0)
-                pos["entry_fee"] = fee_open
-                self.equity -= fee_open
-                pnl = -fee_open
-                event = "OPEN_SHORT"
-
-        rec = {
-            "ts": ts,
-            "symbol": sym,
-            "side": side,
-            "event": event,
-            "qty": qty,
-            "price": px,
-            "pnl": float(pnl),
-            "pnl_net": float(pnl),
-            "pnl_gross": float(pnl_gross),
-            "fee_open": float(fee_open),
-            "fee_close": float(fee_close),
-            "fee_total": float(fee_open + fee_close),
-            "equity": float(self.equity),
-            "reduce_only": bool(reduce_only),
-            "reason": reason,
-        }
-        self._append_journal(rec)
-
-        self.trades.append((ts, sym, side, qty, px, event, pnl))
-        self._update_daily_extrema()
-        return {"status": "FILLED", "price": px, "qty": qty, "equity": self.equity, "event": event, "pnl": float(pnl)}
 
 
 class TradeExecutor:
@@ -225,7 +74,7 @@ class TradeExecutor:
             return {"status": "SKIP", "info": "trading disabled"}
 
         sym = str(symbol).lower()
-        mapped = self.symbol_map.get(sym, sym.upper())
+        mapped = self.symbol_map.get(sym, sym.upper())  # live venue id only
 
         with self.lock:
             # 幂等：3 秒窗口不重复
@@ -278,9 +127,11 @@ class TradeExecutor:
             reduce_only = self.reduce_only_on_exit and (reason in reduce_only_reasons)
 
             # === 执行 ===
+            # Paper book is keyed by the runner symbol (lowercase). `mapped` is
+            # only for a future live venue — paper must not fork a second book.
             if self.mode == "paper":
                 resp = self.paper.place(
-                    mapped, decision, last_px, notional,
+                    sym, decision, last_px, notional,
                     best_bid=best_bid, best_ask=best_ask,
                     reduce_only=reduce_only,
                     slippage_bp=dynamic_slip_bp,
@@ -290,7 +141,15 @@ class TradeExecutor:
                 if resp.get("status") == "FILLED":
                     self._bump_rate(sym)
                     self.idem_guard[sym] = time.time()
-                    return {"status": "FILLED", "fill_px": resp["price"], "qty": resp["qty"], "info": "paper"}
+                    return {
+                        "status": "FILLED",
+                        "fill_px": resp["price"],
+                        "qty": resp["qty"],
+                        "info": "paper",
+                        "event": resp.get("event"),
+                        "events": resp.get("events") or [resp.get("event")],
+                        "pnl": resp.get("pnl"),
+                    }
                 return {"status": resp.get("status", "ERR"), "info": resp.get("info", "paper_error")}
 
             # ==== live（预留位）：未接交易所 SDK 时返回未实现 ====
