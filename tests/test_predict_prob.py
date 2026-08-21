@@ -7,10 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from modules.labels import logits_to_calibrated_prob
-from modules.model import (
-    UncalibratedWeightsError,
-    classification_meta_allows_probability,
-)
 
 
 class CalibratedProbTests(unittest.TestCase):
@@ -67,7 +63,14 @@ class CalibratedProbTests(unittest.TestCase):
             self.assertEqual(mm.head, "classification")
 
     def test_missing_model_meta_refuses_infer_as_probability(self):
-        from modules.model import ModelManager
+        try:
+            from modules.model import (
+                ModelManager,
+                UncalibratedWeightsError,
+                classification_meta_allows_probability,
+            )
+        except Exception:
+            self.skipTest("torch not installed")
 
         with tempfile.TemporaryDirectory() as d:
             # leftover MSE weights, no model_meta.json
@@ -94,7 +97,10 @@ class CalibratedProbTests(unittest.TestCase):
             }))
 
     def test_classification_head_without_prob_meaning_is_refused(self):
-        from modules.model import ModelManager
+        try:
+            from modules.model import ModelManager, UncalibratedWeightsError
+        except Exception:
+            self.skipTest("torch not installed")
 
         with tempfile.TemporaryDirectory() as d:
             Path(d, "tft_model.pth").write_bytes(b"not-a-real-checkpoint")

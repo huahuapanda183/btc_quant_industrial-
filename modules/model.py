@@ -203,7 +203,8 @@ class ModelManager:
         self.model_meta = {}
         if os.path.exists(meta_path):
             try:
-                self.model_meta = json.load(open(meta_path, "r")) or {}
+                with open(meta_path, "r") as mf:
+                    self.model_meta = json.load(mf) or {}
                 self.head = str(self.model_meta.get("head", self.head) or self.head)
                 self.prob_meaning = str(self.model_meta.get("prob_meaning", "") or "")
             except Exception as e:

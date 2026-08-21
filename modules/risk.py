@@ -97,7 +97,8 @@ class RiskController:
         if not os.path.exists(self.state_path):
             return
         try:
-            data = pickle.load(open(self.state_path, "rb"))
+            with open(self.state_path, "rb") as fh:
+                data = pickle.load(fh)
             if isinstance(data, dict):
                 # Pickle is never a fill book. Bound: ledger is authoritative.
                 # Unbound: stay no-position / read-only — do not restore a local book.
