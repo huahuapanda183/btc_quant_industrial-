@@ -8,6 +8,7 @@
 - [ ] 是否出现执行层限流过高（exec_skip:rate_limited）
 - [ ] 是否出现风控过冷（mm_block:cooldown、risk_gate:cooldown异常高）
 - [ ] avg_prob≈0.5 时：是否已重训分类头？温度是否在持出验证段拟合？还是旧 MSE+sigmoid 权重？
+- [ ] 是否存在无 `model_meta.json`（或 meta 未写 classification + p 含义）的 `*.pth`？缺 meta = 旧 MSE，必须拒绝当 P(up)，需 `get_train_data.py` + `train_models.py --offline`
 
 输出建议：
 1) 本轮最可疑指标

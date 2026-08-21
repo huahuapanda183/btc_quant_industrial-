@@ -1,6 +1,7 @@
 """Label construction for a known price path and clock horizon."""
 import unittest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 import yaml
@@ -9,6 +10,7 @@ from modules.labels import (
     build_direction_labels,
     direction_label,
     future_return_at_horizon,
+    horizon_minutes_from_config,
     kappa_from_config,
     time_holdout_purge_embargo,
 )
@@ -66,6 +68,39 @@ class LabelTests(unittest.TestCase):
         self.assertLessEqual(h, 60)
         # must not be a hardcoded "optimal" claim in config — just a number
         self.assertNotIn("optimal", str(cfg.get("label") or {}).lower())
+        # dead trade-count horizon must not be a live config key
+        self.assertNotIn("future_shift", cfg)
+
+    def test_no_code_path_labels_with_future_shift_trades(self):
+        """Clock horizon is the only label horizon. leftover future_shift is ignored."""
+        leftover = {"future_shift": 5, "label": {"horizon_minutes": 20}}
+        self.assertEqual(horizon_minutes_from_config(leftover), 20.0)
+        # even if someone deletes label.horizon_minutes, do not fall back to 5 trades
+        self.assertEqual(horizon_minutes_from_config({"future_shift": 5}), 20.0)
+
+        live_reads = (
+            '["future_shift"]',
+            "['future_shift']",
+            '.get("future_shift"',
+            ".get('future_shift'",
+            "cfg[\"future_shift\"]",
+            "close.shift(-5)",
+            "shift(-5)",
+        )
+        roots = [
+            Path("modules/labels.py"),
+            Path("modules/train_clf.py"),
+            Path("get_train_data.py"),
+            Path("train_models.py"),
+            Path("main.py"),
+        ]
+        for path in roots:
+            src = path.read_text(encoding="utf-8")
+            for needle in live_reads:
+                self.assertNotIn(
+                    needle, src,
+                    f"{path} still has a live trade-count label path: {needle}",
+                )
 
 
 if __name__ == "__main__":

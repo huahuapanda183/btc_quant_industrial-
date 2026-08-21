@@ -107,8 +107,10 @@ sudo docker compose run --rm btc-quant python train_models.py
 训练稳定后会生成：
 - `tft_model.pth` / `nbeats_model.pth`（分类 logit 头，架构未改）
 - `scaler.pkl`（12-d FeatureBuilder，仅 trainer 写）
-- `model_meta.json`（horizon / κ / 概率含义）
+- `model_meta.json`（`head=classification` + `prob_meaning`：p 是时钟窗口 P(up)，不是 σ(MSE 收益)）
 - `thresholds.json` 的 `temp.tft` / `temp.nbt`
+
+**Cut 1 之后必须重训。** 磁盘上没有 `model_meta.json`（或 meta 未同时写明 classification 与 p 的含义）的旧 `tft_model.pth` / `nbeats_model.pth` 一律按旧 MSE 头处理：`ModelManager` **拒绝**把输出当成 P(up)，也不会用可开仓的启发式回退顶上。先删旧权重再跑上面的 `get_train_data.py` → `train_models.py --offline train_data.npz`。
 
 ---
 
@@ -178,7 +180,8 @@ python3 scripts/system_health_report.py
 2. 低波动行情下，策略可能仍偏保守，需要持续调优 `mm + p_min + low_vol`。
 3. 胜率/PNL 依赖 `paper_trades.jsonl` 的成交闭环，不应只看信号数量。
 4. **Cut 1 不声称 live alpha。** 分类头让 `avg_prob≈0.5` 不再是「近零收益残差 + sigmoid」的代数恒等式；它若仍在 0.5 附近，那是数据/可分性问题，不是旧头的必然输出。
-5. 纸面只有一本仓：`PaperBroker`。反手先 CLOSE（记净盈亏）再 OPEN。`PhaseSim` 只报告，不再自开第三本仓。
+5. 纸面只有一本仓：`PaperBroker`。反手先 CLOSE（记净盈亏）再 OPEN。`PhaseSim` 只报告，不再自开第三本仓。`RiskController` 未绑定 `position_view` 时只读 / 无仓，**不会**把本地 pickle 当成成交账本。
+6. 标签窗口只有 `label.horizon_minutes`（时钟）。已删除可训练的 `future_shift` 成交笔数位移。
 
 ---
 
