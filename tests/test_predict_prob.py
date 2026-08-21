@@ -1,9 +1,10 @@
 """predict() emits a classification probability, not σ(MSE return)."""
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from modules.model import logits_to_calibrated_prob
+from modules.labels import logits_to_calibrated_prob
 
 
 class CalibratedProbTests(unittest.TestCase):
@@ -54,16 +55,16 @@ class CalibratedProbTests(unittest.TestCase):
 
 class SingleBookGrepTests(unittest.TestCase):
     def test_phase_sim_is_not_a_fill_book(self):
-        src = open("main.py", encoding="utf-8").read()
+        src = Path("main.py").read_text(encoding="utf-8")
         self.assertIn("bind_ledger", src)
         self.assertIn("不入账", src)
         self.assertNotIn("self.ps.append", src)
         self.assertNotIn("self.closed.append", src)
 
     def test_paper_place_lives_on_ledger(self):
-        ex = open("modules/executor.py", encoding="utf-8").read()
+        ex = Path("modules/executor.py").read_text(encoding="utf-8")
         self.assertIn("from modules.ledger import PaperBroker", ex)
-        led = open("modules/ledger.py", encoding="utf-8").read()
+        led = Path("modules/ledger.py").read_text(encoding="utf-8")
         self.assertIn("CLOSE full size", led)
         self.assertIn("Never overwrite qty/side/entry without a CLOSE event", led)
 

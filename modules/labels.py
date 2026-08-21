@@ -32,6 +32,12 @@ def _as_cfg(cfg: Optional[dict]) -> dict:
     return cfg or {}
 
 
+def logits_to_calibrated_prob(z, T: float = 1.0) -> float:
+    """Guo 2017: p = σ(z / T) on a *classification* logit, not a return residual."""
+    z = float(np.clip(float(z) / max(1e-6, float(T)), -50.0, 50.0))
+    return float(1.0 / (1.0 + np.exp(-z)))
+
+
 def horizon_minutes_from_config(cfg: Optional[dict], default: float = 20.0) -> float:
     cfg = _as_cfg(cfg)
     label = cfg.get("label") or {}

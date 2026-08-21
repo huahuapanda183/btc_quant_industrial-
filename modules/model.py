@@ -21,6 +21,8 @@ except Exception:
         EnhancedTFT = None
         EnhancedNBeats = None
 
+from modules.labels import logits_to_calibrated_prob
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,11 +79,6 @@ class _SimpleScaler:
 def _sigmoid(x):
     x = np.clip(x, -50.0, 50.0)
     return 1.0 / (1.0 + np.exp(-x))
-
-
-def logits_to_calibrated_prob(z, T: float = 1.0) -> float:
-    """Guo 2017: p = σ(z / T) on a *classification* logit, not a return residual."""
-    return float(_sigmoid(float(z) / max(1e-6, float(T))))
 
 class _FallbackModel:
     """
@@ -144,7 +141,8 @@ class ModelManager:
 
         if os.path.exists("thresholds.json"):
             try:
-                j = json.load(open("thresholds.json", "r"))
+                with open("thresholds.json", "r") as fh:
+                    j = json.load(fh)
                 t = j.get("temp", 1.0)
                 if isinstance(t, dict):
                     self.T_tft = float(t.get("tft", 1.0))
