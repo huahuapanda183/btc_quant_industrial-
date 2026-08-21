@@ -8,6 +8,7 @@
 __all__ = [
     "collector",
     "features",
+    "bars",
     "model",
     "push",
     "signal",

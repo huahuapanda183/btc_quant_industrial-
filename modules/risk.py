@@ -86,6 +86,10 @@ class RiskController:
         self.eps = float(rc.get("eps", 1e-6))
         self._breakeven_armed = False
 
+        tcfg = cfg.get("trading") or {}
+        # Default false: freeze new opens / flips. TP/SL/timeout still emit exits.
+        self.allow_new_opens = bool(tcfg.get("allow_new_opens", False))
+
         self.state_path = f"{self.symbol}_risk.pkl"
         self._pending_exit = None  # (decision, reason) until the ledger fill lands
         self._book_side = None
@@ -341,6 +345,11 @@ class RiskController:
             # 时间平仓
             if self.entry_time and (now - self.entry_time) >= self.future_holding * 60:
                 return self._emit_exit("BUY", "timeout")
+
+        # Frozen: p must not size or flip. Exits already returned above.
+        if not self.allow_new_opens:
+            if signal != "HOLD" and signal != self.position:
+                return "HOLD", "opens_frozen"
 
         # ===== 反手护栏：持仓后 N 秒内禁止反手（MM 可选择绕过）=====
         if self.position in ("BUY", "SELL") and signal in ("BUY", "SELL") and signal != self.position:

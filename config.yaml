@@ -34,6 +34,8 @@ trading:
   mode: paper
   venue: futures
   testnet: true
+  # Strategy freeze: p must not size or flip. Exits still hit PaperBroker.
+  allow_new_opens: false
   taker_fee_bp: 2.0
   slippage_bp: 3.0
   base_notional_usd: 100

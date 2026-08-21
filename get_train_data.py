@@ -1,6 +1,7 @@
 """Offline FeatureBuilder dataset builder — *not* a second trainer.
 
-Builds the same 12-d FeatureBuilder schema used at infer, plus clock-horizon
+Builds the same 12-d FeatureBuilder schema used at live infer
+(one closed 1m kline → features.build_from_kline), plus clock-horizon
 direction labels. Writes train_data.npz (and a wide CSV for inspection).
 
 Does NOT write scaler.pkl / tft_model.pth / nbeats_model.pth. Those artifacts
@@ -17,7 +18,7 @@ import requests
 import time
 import yaml
 
-from modules.features import FeatureBuilder
+from modules.features import FeatureBuilder, build_from_kline, synth_kline_events
 from modules.labels import (
     build_direction_labels,
     horizon_minutes_from_config,
@@ -107,12 +108,8 @@ def resolve_symbol():
 
 
 def _synth_events(o, h, l, c, v):
-    spread = max((h - l) * 0.05, c * 0.00015)
-    bid = c - spread / 2
-    ask = c + spread / 2
-    depth_evt = {"b": [[str(bid), str(max(v * 0.5, 1.0))]], "a": [[str(ask), str(max(v * 0.5, 1.0))]]}
-    trade_evt = {"p": str(c), "q": str(max(v * 0.1, 1.0)), "m": False}
-    return trade_evt, depth_evt
+    """Back-compat alias — live and offline share features.synth_kline_events."""
+    return synth_kline_events(o, h, l, c, v)
 
 
 def build_offline_dataset(cfg: dict = None, df: pd.DataFrame = None) -> dict:
@@ -143,8 +140,7 @@ def build_offline_dataset(cfg: dict = None, df: pd.DataFrame = None) -> dict:
         h = float(row.get("high", c))
         l = float(row.get("low", c))
         v = float(row.get("volume", 1.0))
-        trade_evt, depth_evt = _synth_events(o, h, l, c, v)
-        seq = fb.build(trade_evt, depth_evt)
+        seq = build_from_kline(fb, o, h, l, c, v)
         t = row["time"]
         ts = t.timestamp() if hasattr(t, "timestamp") else float(t)
         if seq is None:

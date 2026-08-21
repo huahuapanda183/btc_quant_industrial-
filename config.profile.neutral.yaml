@@ -35,5 +35,6 @@ mm:
 trading:
   enabled: true
   mode: paper
+  allow_new_opens: false
   base_notional_usd: 100
   leverage: 1

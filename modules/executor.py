@@ -33,6 +33,8 @@ class TradeExecutor:
         self.slippage_bp = float(tcfg.get("slippage_bp", 5))
         self.order_type = str(tcfg.get("order_type", "MARKET")).upper()
         self.testnet = bool(tcfg.get("testnet", True))
+        # Default false: p must not size or flip. Exits (reduce-only) still fill.
+        self.allow_new_opens = bool(tcfg.get("allow_new_opens", False))
 
         # 依赖注入
         self.price_getter = price_getter          # fn(symbol)->last_price
@@ -125,6 +127,9 @@ class TradeExecutor:
             # reduce_only：风控给出的平仓类原因
             reduce_only_reasons = {"take_profit", "stop_loss", "trail_take", "timeout", "breakeven", "fast_take"}
             reduce_only = self.reduce_only_on_exit and (reason in reduce_only_reasons)
+
+            if (not reduce_only) and (not self.allow_new_opens):
+                return {"status": "SKIP", "info": "allow_new_opens=false"}
 
             # === 执行 ===
             # Paper book is keyed by the runner symbol (lowercase). `mapped` is
