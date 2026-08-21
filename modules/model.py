@@ -26,6 +26,44 @@ from modules.labels import logits_to_calibrated_prob
 logger = logging.getLogger(__name__)
 
 
+class UncalibratedWeightsError(RuntimeError):
+    """Old MSE (or unknown) weights cannot be served as P(up). Retrain required."""
+
+
+def classification_meta_allows_probability(meta: dict | None) -> bool:
+    """True only when meta attests a classification head and states what p means.
+
+    Missing meta is treated as the pre-cut MSE-return head. A head tag without
+    `prob_meaning` is also insufficient — that is how infer used to launder
+    σ(predicted return) as a buy probability.
+    """
+    if not isinstance(meta, dict) or not meta:
+        return False
+    head = str(meta.get("head") or "").strip().lower()
+    if head != "classification":
+        return False
+    meaning = str(meta.get("prob_meaning") or "").strip()
+    if not meaning:
+        return False
+    low = meaning.lower()
+    looks_like_prob = (
+        "p(" in low
+        or "prob" in low
+        or "probability" in low
+        or "classification" in low
+    )
+    looks_like_return_residual = "mse" in low and "return" in low
+    return looks_like_prob and not looks_like_return_residual
+
+
+def _retrain_required_msg(detail: str) -> str:
+    return (
+        f"{detail} Missing/invalid model_meta.json is treated as the old MSE head. "
+        "Do not serve σ(z/T) as P(up). Retrain required: "
+        "`python get_train_data.py` then `python train_models.py --offline train_data.npz`."
+    )
+
+
 # ========= 简易 scaler（与 sklearn.StandardScaler 接口对齐）=========
 class _SimpleScaler:
     """
@@ -117,10 +155,13 @@ class ModelManager:
     The head is a direction classifier. `prob` is P(up over the configured
     clock horizon after temperature scaling). It is *not* σ(predicted return).
     """
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, artifact_dir: str | None = None):
         self.symbol = str(symbol).lower()
-        self.head = "classification"
-        self.prob_meaning = "P(r_{t→t+h} > κ) after temperature scaling"
+        self.artifact_dir = artifact_dir or "."
+        self.head = "unknown"
+        self.prob_meaning = ""
+        self.infer_as_probability = False
+        self.infer_disabled_reason = ""
 
         # === 读取配置 ===
         cfg = {}
@@ -139,9 +180,10 @@ class ModelManager:
         self.blend_w = [0.6, 0.4]
         self.blend_b = 0.0
 
-        if os.path.exists("thresholds.json"):
+        thresholds_path = os.path.join(self.artifact_dir, "thresholds.json")
+        if os.path.exists(thresholds_path):
             try:
-                with open("thresholds.json", "r") as fh:
+                with open(thresholds_path, "r") as fh:
                     j = json.load(fh)
                 t = j.get("temp", 1.0)
                 if isinstance(t, dict):
@@ -157,28 +199,30 @@ class ModelManager:
             except Exception as e:
                 logger.warning(f"[ModelMgr] thresholds.json 读取失败: {e}")
 
+        meta_path = os.path.join(self.artifact_dir, "model_meta.json")
         self.model_meta = {}
-        if os.path.exists("model_meta.json"):
+        if os.path.exists(meta_path):
             try:
-                self.model_meta = json.load(open("model_meta.json", "r")) or {}
-                self.head = str(self.model_meta.get("head", self.head))
-                self.prob_meaning = str(self.model_meta.get("prob_meaning", self.prob_meaning))
+                with open(meta_path, "r") as mf:
+                    self.model_meta = json.load(mf) or {}
+                self.head = str(self.model_meta.get("head", self.head) or self.head)
+                self.prob_meaning = str(self.model_meta.get("prob_meaning", "") or "")
             except Exception as e:
                 logger.warning(f"[ModelMgr] model_meta.json 读取失败: {e}")
-        if self.head != "classification":
-            logger.warning(
-                "[ModelMgr] model_meta.head=%s — predict() still applies σ(z/T). "
-                "Retrain with train_models.py so z is a classification logit, "
-                "otherwise avg_prob≈0.5 can be an algebraic identity of an MSE-return head.",
-                self.head,
-            )
+                self.model_meta = {}
+
+        tft_path = os.path.join(self.artifact_dir, "tft_model.pth")
+        nbeats_path = os.path.join(self.artifact_dir, "nbeats_model.pth")
+        has_weight_files = os.path.exists(tft_path) or os.path.exists(nbeats_path)
+        meta_ok = classification_meta_allows_probability(self.model_meta)
 
         # === Scaler ===
         self.scaler = None
         loaded_scaler = None
-        if os.path.exists("scaler.pkl") and joblib is not None:
+        scaler_path = os.path.join(self.artifact_dir, "scaler.pkl")
+        if os.path.exists(scaler_path) and joblib is not None:
             try:
-                loaded_scaler = joblib.load("scaler.pkl")
+                loaded_scaler = joblib.load(scaler_path)
                 logger.info("[ModelMgr] scaler.pkl 已加载")
             except Exception as e:
                 logger.warning(f"[ModelMgr] 读取 scaler.pkl 失败，将使用恒等 scaler: {e}")
@@ -191,17 +235,29 @@ class ModelManager:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tft = None
         self.nbeats = None
+        self.fallback = None
+
+        if has_weight_files and not meta_ok:
+            # Fail closed: leftover MSE weights must not be sigmoid'd into P(up).
+            # Do not load .pth and do not enable the heuristic fallback (that can trade).
+            self.infer_as_probability = False
+            self.infer_disabled_reason = _retrain_required_msg(
+                "tft_model.pth/nbeats_model.pth present without classification meta."
+            )
+            logger.error("[ModelMgr] REFUSE infer-as-probability: %s", self.infer_disabled_reason)
+            self._ema = None
+            return
 
         # 加载 TFT
-        if EnhancedTFT is not None and os.path.exists("tft_model.pth"):
+        if EnhancedTFT is not None and os.path.exists(tft_path):
             try:
                 self.tft = EnhancedTFT(self.input_size).to(self.device)
-                state = torch.load("tft_model.pth", map_location=self.device)
+                state = torch.load(tft_path, map_location=self.device)
                 if isinstance(state, dict):
                     self.tft.load_state_dict(state, strict=False)
                 else:
                     # 兼容 TorchScript
-                    self.tft = torch.jit.load("tft_model.pth", map_location=self.device)
+                    self.tft = torch.jit.load(tft_path, map_location=self.device)
                 self.tft.eval()
                 logger.info("[ModelMgr] tft_model.pth 已加载")
             except Exception as e:
@@ -214,14 +270,14 @@ class ModelManager:
                 logger.warning("[ModelMgr] 未找到 tft_model.pth，跳过 TFT")
 
         # 加载 NBeats
-        if EnhancedNBeats is not None and os.path.exists("nbeats_model.pth"):
+        if EnhancedNBeats is not None and os.path.exists(nbeats_path):
             try:
                 self.nbeats = EnhancedNBeats(self.input_size).to(self.device)
-                state = torch.load("nbeats_model.pth", map_location=self.device)
+                state = torch.load(nbeats_path, map_location=self.device)
                 if isinstance(state, dict):
                     self.nbeats.load_state_dict(state, strict=False)
                 else:
-                    self.nbeats = torch.jit.load("nbeats_model.pth", map_location=self.device)
+                    self.nbeats = torch.jit.load(nbeats_path, map_location=self.device)
                 self.nbeats.eval()
                 logger.info("[ModelMgr] nbeats_model.pth 已加载")
             except Exception as e:
@@ -233,11 +289,20 @@ class ModelManager:
             else:
                 logger.warning("[ModelMgr] 未找到 nbeats_model.pth，跳过 NBeats")
 
-        # 全缺则启用回退
-        self.fallback = None
-        if self.tft is None and self.nbeats is None:
-            logger.warning("[ModelMgr] 未加载到任何模型，启用回退模型")
+        if has_weight_files:
+            # Weights were attested by classification meta; serve as P(up).
+            self.infer_as_probability = True
+            self.head = str(self.model_meta.get("head", "classification"))
+            self.prob_meaning = str(self.model_meta.get("prob_meaning", self.prob_meaning))
+        else:
+            # No leftover .pth: heuristic fallback is not the old MSE head.
+            # It is still *not* a calibrated P(up); keep it for unit tests / no-weight
+            # smoke, but mark the meaning explicitly.
+            logger.warning("[ModelMgr] 未加载到任何模型，启用回退模型（非校准 P(up)）")
             self.fallback = _FallbackModel(T=self.T_tft)
+            self.infer_as_probability = True
+            self.head = "fallback_heuristic"
+            self.prob_meaning = "heuristic fallback; not a trained classification P(up)"
 
         # 运行平均日志
         self._ema = None
@@ -293,7 +358,13 @@ class ModelManager:
         输出：(label:int{0,1}, prob:float)
 
         prob is a calibrated class probability (P(up over horizon)), not σ(MSE return).
+        Refuses when leftover .pth files have no classification model_meta.
         """
+        if not self.infer_as_probability:
+            raise UncalibratedWeightsError(
+                self.infer_disabled_reason
+                or _retrain_required_msg("infer-as-probability is disabled.")
+            )
         try:
             Xs = self._prep(features_seq)         # (T, F)
             raw_last = Xs * 0.0 + features_seq[-1][:Xs.shape[1]] if np.asarray(features_seq).ndim == 2 else Xs[-1]

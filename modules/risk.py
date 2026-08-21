@@ -30,6 +30,8 @@ class RiskController:
       - 可传 price_data["cooldown_release"]=True 以在冷却期内事件化放行
       - 纸面交易必须注入 position_view（读 PaperBroker）。judge 只做决策，
         不改账本；反手/平仓都等 fill 之后才与账本对齐。
+      - Unbound (no position_view): read-only / no-position. Never write a
+        local pickle book as if it were fills. One ledger: PaperBroker.
     """
     def __init__(self, symbol: str, position_view: Optional[Callable[[], Dict[str, Any]]] = None):
         self.symbol = symbol.lower()
@@ -95,17 +97,21 @@ class RiskController:
         if not os.path.exists(self.state_path):
             return
         try:
-            data = pickle.load(open(self.state_path, "rb"))
+            with open(self.state_path, "rb") as fh:
+                data = pickle.load(fh)
             if isinstance(data, dict):
-                # When a ledger view is bound, pickle is not the fill book.
-                if self.position_view is None:
-                    self.position = data.get("position", "HOLD")
-                    self.last_price = data.get("last_price", None)
-                    self.entry_time = data.get("entry_time", 0.0)
-                self.last_trade_time = data.get("last_trade_time", 0.0)
-                self._peak = data.get("peak", None)
-                self._trough = data.get("trough", None)
-                self._breakeven_armed = data.get("breakeven_armed", False)
+                # Pickle is never a fill book. Bound: ledger is authoritative.
+                # Unbound: stay no-position / read-only — do not restore a local book.
+                if self.position_view is not None:
+                    self.last_trade_time = data.get("last_trade_time", 0.0)
+                    self._peak = data.get("peak", None)
+                    self._trough = data.get("trough", None)
+                    self._breakeven_armed = data.get("breakeven_armed", False)
+                else:
+                    self.position = "HOLD"
+                    self.last_price = None
+                    self.entry_time = 0.0
+                    self.last_trade_time = data.get("last_trade_time", 0.0)
             else:
                 self.position, self.last_price = "HOLD", None
         except Exception:
@@ -116,11 +122,14 @@ class RiskController:
                 pass
 
     def save_state(self):
+        # Unbound: never persist a local position book. Pickle is not fills.
+        if self.position_view is None:
+            return
         state = {
-            "position": self.position if self.position_view is None else "HOLD",
-            "last_price": self.last_price if self.position_view is None else None,
+            "position": "HOLD",
+            "last_price": None,
             "last_trade_time": self.last_trade_time,
-            "entry_time": self.entry_time if self.position_view is None else 0.0,
+            "entry_time": 0.0,
             "peak": self._peak,
             "trough": self._trough,
             "breakeven_armed": self._breakeven_armed
@@ -172,6 +181,9 @@ class RiskController:
 
     def on_fill(self, decision: str, reason: str, price: float, exec_resp: Optional[Dict[str, Any]] = None):
         """Update tracking after a PaperBroker fill. Does not write the book."""
+        if self.position_view is None:
+            # Unbound: no local book. Ignore fill-shaped mutations.
+            return
         self.last_trade_time = time.time()
         events = []
         if exec_resp:
@@ -181,11 +193,8 @@ class RiskController:
         ev_join = " ".join(str(e) for e in events)
         if reason in EXIT_REASONS or "CLOSE" in ev_join:
             self._pending_exit = None
-            if self.position_view is None:
-                self._reset_position()
-            else:
-                self._peak = self._trough = None
-                self._breakeven_armed = False
+            self._peak = self._trough = None
+            self._breakeven_armed = False
         if reason == "open" or "OPEN" in ev_join or "REVERSE" in ev_join:
             self._pending_exit = None
             self.entry_time = time.time()
@@ -196,9 +205,6 @@ class RiskController:
                 self._trough = float(price)
                 self._peak = None
             self._breakeven_armed = False
-            if self.position_view is None:
-                self.position = decision
-                self.last_price = float(price)
         self.save_state()
 
     # ========= 工具 =========
@@ -232,6 +238,13 @@ class RiskController:
           - 'reason_text'（可选）传入 SignalFusion 的 diag；含 "mm_gate" 视为 MM 直通
           - 'cooldown_release'（可选）冷却内事件放行
         """
+        if self.position_view is None:
+            # Fail closed: no second book. Stay flat / read-only.
+            self.position = "HOLD"
+            self.last_price = None
+            self.entry_time = 0.0
+            return "HOLD", "unbound_no_ledger"
+
         self._sync_from_ledger()
         p = float(price_data.get("p", price_data.get("price", 0.0)))
         closes = price_data.get("close", None)
@@ -348,30 +361,24 @@ class RiskController:
 
         # ===== 新开仓 / 反手（只决策，账本由 PaperBroker 平后开）=====
         if signal != "HOLD" and signal != self.position:
-            if self.position_view is None:
-                # isolated / no ledger: keep legacy local book so unit tests work
-                self.position = signal
-                self.last_price = p
-                self.last_trade_time = now
-                self.entry_time = now
-                self._peak = p if signal == "BUY" else None
-                self._trough = p if signal == "SELL" else None
-                self._breakeven_armed = False
-                self.save_state()
             return signal, "open"
 
         return "HOLD", "no_change"
 
     def _emit_exit(self, decision: str, reason: str):
         if self.position_view is None:
-            self._reset_position()
-        else:
-            self._pending_exit = (decision, reason)
-            self.save_state()
+            return "HOLD", "unbound_no_ledger"
+        self._pending_exit = (decision, reason)
+        self.save_state()
         return decision, reason
 
     def _reset_position(self):
-        """Local-only flatten. Must not be the paper fill."""
+        """Tracking reset only. Must not be the paper fill. Unbound is a no-op."""
+        if self.position_view is None:
+            self.position = "HOLD"
+            self.last_price = None
+            self.entry_time = 0.0
+            return
         self.position = "HOLD"
         self.last_price = None
         self.last_trade_time = time.time()

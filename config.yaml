@@ -14,9 +14,8 @@ push_enabled: true
 symbol: BTCUSDT
 interval: 1m
 lookback_hours: 48
-# deprecated: was the MSE-return trade-count horizon. Unused by the classifier.
-future_shift: 5
-# Clock-horizon direction labels (15/30/60 are sweepable; 20 is a default, not an optimum)
+# Clock-horizon direction labels (15/30/60 are sweepable; 20 is a default, not an optimum).
+# This is the only label horizon. Do not add a trade-count shift (the old future_shift: 5 path).
 label:
   horizon_minutes: 20
   dead_zone: 0.0

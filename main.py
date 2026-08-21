@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from modules.collector import BinanceCollector
 from modules.features import FeatureBuilder
-from modules.model import ModelManager
+from modules.model import ModelManager, UncalibratedWeightsError
 from modules.push import PushManager
 from modules.signal import SignalFusion
 from modules.risk import RiskController
@@ -564,7 +564,12 @@ class SymbolRunner:
                         continue
                     self._last_infer_ts = now_cool
 
-                label, prob = self.mm.predict(seq)
+                try:
+                    label, prob = self.mm.predict(seq)
+                except UncalibratedWeightsError as e:
+                    # Fail closed: leftover MSE weights are not P(up). Cannot open.
+                    self.logger.error(f"[{self.symbol}] infer refused (not P(up)): {e}")
+                    continue
                 self.logger.info(f"[{self.symbol}] prob={prob:.3f} label={label}")
 
                 book_snapshot, last_q_ms, d_spread_dt_bp, now_ms = self.collector.get_orderbook_ctx()

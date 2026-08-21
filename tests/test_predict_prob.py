@@ -1,4 +1,6 @@
 """predict() emits a classification probability, not σ(MSE return)."""
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,18 +41,76 @@ class CalibratedProbTests(unittest.TestCase):
             def eval(self):
                 return self
 
-        mm = ModelManager("btcusdt")
-        mm.tft = ConstLogit(2.0)
-        mm.nbeats = None
-        mm.fallback = None
-        mm.T_tft = 2.0
-        mm.blend_b = 0.0
-        seq = np.zeros((30, 12), dtype=np.float32)
-        label, p = mm.predict(seq)
-        expected = logits_to_calibrated_prob(2.0, 2.0)
-        self.assertAlmostEqual(p, expected, places=5)
-        self.assertEqual(label, 1)
-        self.assertEqual(mm.head, "classification")
+        with tempfile.TemporaryDirectory() as d:
+            meta = {
+                "head": "classification",
+                "prob_meaning": "P(r_{t→t+20m} > κ) after temperature scaling",
+            }
+            Path(d, "model_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            mm = ModelManager("btcusdt", artifact_dir=d)
+            mm.tft = ConstLogit(2.0)
+            mm.nbeats = None
+            mm.fallback = None
+            mm.infer_as_probability = True
+            mm.head = "classification"
+            mm.T_tft = 2.0
+            mm.blend_b = 0.0
+            seq = np.zeros((30, 12), dtype=np.float32)
+            label, p = mm.predict(seq)
+            expected = logits_to_calibrated_prob(2.0, 2.0)
+            self.assertAlmostEqual(p, expected, places=5)
+            self.assertEqual(label, 1)
+            self.assertEqual(mm.head, "classification")
+
+    def test_missing_model_meta_refuses_infer_as_probability(self):
+        try:
+            from modules.model import (
+                ModelManager,
+                UncalibratedWeightsError,
+                classification_meta_allows_probability,
+            )
+        except Exception:
+            self.skipTest("torch not installed")
+
+        with tempfile.TemporaryDirectory() as d:
+            # leftover MSE weights, no model_meta.json
+            Path(d, "tft_model.pth").write_bytes(b"not-a-real-checkpoint")
+            Path(d, "nbeats_model.pth").write_bytes(b"not-a-real-checkpoint")
+            mm = ModelManager("btcusdt", artifact_dir=d)
+            self.assertFalse(mm.infer_as_probability)
+            self.assertIsNone(mm.tft)
+            self.assertIsNone(mm.nbeats)
+            self.assertIsNone(mm.fallback)
+            with self.assertRaises(UncalibratedWeightsError) as ctx:
+                mm.predict(np.zeros((30, 12), dtype=np.float32))
+            msg = str(ctx.exception).lower()
+            self.assertIn("mse", msg)
+            self.assertIn("retrain", msg)
+            self.assertFalse(classification_meta_allows_probability({}))
+            self.assertFalse(classification_meta_allows_probability({"head": "classification"}))
+            self.assertFalse(classification_meta_allows_probability(
+                {"head": "regression", "prob_meaning": "predicted return"}
+            ))
+            self.assertTrue(classification_meta_allows_probability({
+                "head": "classification",
+                "prob_meaning": "P(r_{t→t+20m} > κ) after temperature scaling",
+            }))
+
+    def test_classification_head_without_prob_meaning_is_refused(self):
+        try:
+            from modules.model import ModelManager, UncalibratedWeightsError
+        except Exception:
+            self.skipTest("torch not installed")
+
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "tft_model.pth").write_bytes(b"not-a-real-checkpoint")
+            Path(d, "model_meta.json").write_text(
+                json.dumps({"head": "classification"}), encoding="utf-8"
+            )
+            mm = ModelManager("btcusdt", artifact_dir=d)
+            self.assertFalse(mm.infer_as_probability)
+            with self.assertRaises(UncalibratedWeightsError):
+                mm.predict(np.zeros((8, 12), dtype=np.float32))
 
 
 class SingleBookGrepTests(unittest.TestCase):

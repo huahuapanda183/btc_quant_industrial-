@@ -10,6 +10,8 @@ Label (binary, default):
     y = None (dropped) if |r| ≤ κ   when drop_deadzone is true
 
 h is *clock time* (label.horizon_minutes), not N trades.
+There is no live `future_shift` / trade-count label path. If a caller
+still has that key in a leftover config, it is ignored.
 κ defaults to a round-trip cost:
     κ = 2 * (taker_fee_bp + slippage_bp) / 1e4  +  label.dead_zone
 
@@ -39,9 +41,13 @@ def logits_to_calibrated_prob(z, T: float = 1.0) -> float:
 
 
 def horizon_minutes_from_config(cfg: Optional[dict], default: float = 20.0) -> float:
+    """Clock minutes only. Never reads a trade-count `future_shift`."""
     cfg = _as_cfg(cfg)
     label = cfg.get("label") or {}
-    return float(label.get("horizon_minutes", default))
+    if "horizon_minutes" in label and label.get("horizon_minutes") is not None:
+        return float(label["horizon_minutes"])
+    # leftover top-level future_shift is dead — do not train on N-trade shift
+    return float(default)
 
 
 def horizon_seconds_from_config(cfg: Optional[dict], default: float = 20.0) -> float:

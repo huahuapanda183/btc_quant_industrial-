@@ -1,5 +1,6 @@
 """Reverse is close-then-open; one book used by risk exits and paper fills."""
 import json
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,45 @@ class LedgerReverseTests(unittest.TestCase):
     def test_authoritative_ledger_constant(self):
         self.assertEqual(AUTHORITATIVE_LEDGER, "modules.ledger.PaperBroker")
         self.assertIs(PaperBroker, PaperBroker)
+
+    def test_unbound_risk_cannot_open_or_overwrite_local_position(self):
+        """No position_view: stay flat / read-only. Never write a local fill book."""
+        risk = RiskController("btcusdt")  # unbound
+        risk.state_path = str(Path(self.tmp.name) / "unbound_risk.pkl")
+        # leftover pickle that used to be treated as a local book
+        stale = {
+            "position": "BUY",
+            "last_price": 100.0,
+            "last_trade_time": 1.0,
+            "entry_time": 1.0,
+            "peak": 100.0,
+            "trough": None,
+            "breakeven_armed": False,
+        }
+        with open(risk.state_path, "wb") as f:
+            pickle.dump(stale, f)
+        risk.load_state()
+        self.assertEqual(risk.position, "HOLD")
+        self.assertIsNone(risk.last_price)
+
+        before = Path(risk.state_path).read_bytes()
+        d, reason = risk.judge("BUY", {"p": 100.0, "close": [100.0, 100.1]})
+        self.assertEqual(d, "HOLD")
+        self.assertEqual(reason, "unbound_no_ledger")
+        self.assertEqual(risk.position, "HOLD")
+        self.assertIsNone(risk.last_price)
+
+        # must not rewrite pickle as if a fill landed (stale BUY on disk is ignored)
+        self.assertEqual(Path(risk.state_path).read_bytes(), before)
+        risk.save_state()
+        self.assertEqual(Path(risk.state_path).read_bytes(), before)
+
+        # on_fill must not open/overwrite a local book either
+        risk.on_fill("BUY", "open", 110.0, {"event": "OPEN_LONG", "status": "FILLED"})
+        self.assertEqual(risk.position, "HOLD")
+        self.assertIsNone(risk.last_price)
+        self.assertFalse(risk.in_position())
+        self.assertEqual(Path(risk.state_path).read_bytes(), before)
 
 
 if __name__ == "__main__":
