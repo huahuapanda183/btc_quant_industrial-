@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules.features import FeatureBuilder
+from modules.features import FeatureBuilder, build_from_kline
 from modules.model import ModelManager
 
 
@@ -44,12 +44,7 @@ def main():
     kl = fetch_okx(inst, bar="1m", limit=900)
     probs = []
     for _, o, h, l, c, v in kl:
-        spread = max((h - l) * 0.05, c * 0.00015)
-        bid = c - spread / 2
-        ask = c + spread / 2
-        depth_evt = {"b": [[str(bid), str(max(v * 0.5, 1.0))]], "a": [[str(ask), str(max(v * 0.5, 1.0))]]}
-        trade_evt = {"p": str(c), "q": str(max(v * 0.1, 1.0)), "m": False}
-        seq = fb.build(trade_evt, depth_evt)
+        seq = build_from_kline(fb, o, h, l, c, v)
         if seq is None:
             continue
         _, p = mm.predict(seq)

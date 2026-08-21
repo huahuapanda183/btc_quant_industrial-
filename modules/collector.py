@@ -222,6 +222,7 @@ class BinanceCollector:
 
         self.aggtrade_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@aggTrade"
         self.depth_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@depth20@100ms"
+        self.kline_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@kline_1m"
         self.okx_uri = os.getenv("OKX_WS_PUBLIC", "wss://ws.okx.com:8443/ws/v5/public")
 
         self._queue = asyncio.Queue()
@@ -245,12 +246,14 @@ class BinanceCollector:
         if self.provider == "okx":
             await asyncio.gather(
                 self._connect_okx("trades"),
-                self._connect_okx("books5")
+                self._connect_okx("books5"),
+                self._connect_okx("candle1m"),
             )
         else:
             await asyncio.gather(
                 self._connect_binance(self.aggtrade_uri, "aggTrade"),
-                self._connect_binance(self.depth_uri, "depth20")
+                self._connect_binance(self.depth_uri, "depth20"),
+                self._connect_binance(self.kline_uri, "kline"),
             )
 
     async def _connect_binance(self, uri: str, channel_name: str):
@@ -268,6 +271,8 @@ class BinanceCollector:
                                 bids = data.get("b") or data.get("bids") or []
                                 asks = data.get("a") or data.get("asks") or []
                                 self.ob_state.on_depth_update(bids, asks)
+                            elif channel_name == "kline":
+                                data = self._normalize_binance_kline(data)
                             await self._queue.put(data)
                             self._cache.append(data)
                         except Exception as e:
@@ -309,6 +314,11 @@ class BinanceCollector:
                                 }
                                 await self._queue.put(data)
                                 self._cache.append(data)
+                            elif channel == "candle1m":
+                                row = rows[0]
+                                data = self._normalize_okx_kline(row)
+                                await self._queue.put(data)
+                                self._cache.append(data)
                             else:  # books5
                                 row = rows[0]
                                 bids = row.get("bids") or []
@@ -341,17 +351,65 @@ class BinanceCollector:
         while True:
             yield await self._queue.get()
 
+    @staticmethod
+    def _normalize_binance_kline(data: dict) -> dict:
+        k = data.get("k") or {}
+        try:
+            closed = bool(k.get("x", False))
+            return {
+                "channel": "kline",
+                "recv_ts": data.get("recv_ts"),
+                "open_ts_ms": int(k.get("t") or 0),
+                "o": float(k.get("o") or 0),
+                "h": float(k.get("h") or 0),
+                "l": float(k.get("l") or 0),
+                "c": float(k.get("c") or 0),
+                "v": float(k.get("v") or 0),
+                "closed": closed,
+            }
+        except (TypeError, ValueError):
+            return {"channel": "kline", "closed": False, "open_ts_ms": 0,
+                    "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 0.0}
+
+    @staticmethod
+    def _normalize_okx_kline(row) -> dict:
+        # [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        try:
+            confirm = str(row[8]) if len(row) > 8 else "0"
+            return {
+                "channel": "kline",
+                "recv_ts": datetime.utcnow().isoformat(),
+                "open_ts_ms": int(row[0]),
+                "o": float(row[1]),
+                "h": float(row[2]),
+                "l": float(row[3]),
+                "c": float(row[4]),
+                "v": float(row[5]) if len(row) > 5 else 0.0,
+                "closed": confirm in ("1", "true", "True"),
+            }
+        except (TypeError, ValueError, IndexError):
+            return {"channel": "kline", "closed": False, "open_ts_ms": 0,
+                    "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 0.0}
+
     async def stream(self):
+        """Yield (trade, depth, kline). At most one of the three is set per item.
+
+        kline payloads are normalized: {open_ts_ms, o, h, l, c, v, closed}.
+        Downstream must ignore forming bars (closed=False).
+        """
         while True:
             trade_data = None
             depth_data = None
+            kline_data = None
             data = await self._queue.get()
             ch = data.get("channel")
             if ch == "aggTrade":
                 trade_data = data
             elif ch == "depth20":
                 depth_data = data
-            yield trade_data, depth_data
+            elif ch == "kline":
+                kline_data = data
+            yield trade_data, depth_data, kline_data
 
     def get_recent_cache(self):
         return list(self._cache)

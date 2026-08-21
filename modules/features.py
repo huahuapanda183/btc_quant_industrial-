@@ -111,14 +111,52 @@ class _StateInd:
 
         return ret, macd, macdH, rsi, vol_abs, buy_dom, self.vwap
 
+# Book-derived columns in the 12-d row. Offline/live closed-bar infer fills
+# these from synth_kline_events (OHLC), never from a live L2 snapshot.
+BOOK_FEATURE_IDX = {"imb": 7, "spread_prop": 8, "micro_bias": 9}
+
+
+def synth_kline_events(o, h, l, c, v):
+    """One closed candle → one (trade, depth) pair for FeatureBuilder.
+
+    Same mapping as get_train_data replay. Live infer must use this, not the
+    live L2 book, so MACD/RSI/seq_len walk 1-minute bars rather than trades.
+    """
+    o = float(o); h = float(h); l = float(l); c = float(c); v = float(v)
+    spread = max((h - l) * 0.05, c * 0.00015)
+    bid = c - spread / 2
+    ask = c + spread / 2
+    depth_evt = {"b": [[str(bid), str(max(v * 0.5, 1.0))]], "a": [[str(ask), str(max(v * 0.5, 1.0))]]}
+    trade_evt = {"p": str(c), "q": str(max(v * 0.1, 1.0)), "m": False}
+    return trade_evt, depth_evt
+
+
+def build_from_kline(fb: "FeatureBuilder", o, h, l, c, v):
+    """One closed 1m kline → one FeatureBuilder.build. No live book attached."""
+    trade_evt, depth_evt = synth_kline_events(o, h, l, c, v)
+    return fb.build(trade_evt, depth_evt)
+
+
 class FeatureBuilder:
-    """构建与 signal.py 对齐的 12 维特征；不足 seq_len 时返回 None。"""
+    """构建与 signal.py 对齐的 12 维特征；不足 seq_len 时返回 None。
+
+    Live infer: one *closed* 1m kline → one update_closed_kline / build_from_kline.
+    Do not feed tick prints or a live L2 book into the model sequence.
+    """
     def __init__(self, seq_len: int = 30, k_levels: int = 3):
         self.seq_len = int(seq_len)
         self.k = int(k_levels)
         self.buf = deque(maxlen=max(self.seq_len * 2, 128))
         self.ind = _StateInd()
         self._prev_macdH = None
+
+    def update(self, trade_evt: dict, depth_evt: dict = None):
+        """Alias of build() — one event → one row (offline replay / closed kline)."""
+        return self.build(trade_evt, depth_evt)
+
+    def update_closed_kline(self, o, h, l, c, v):
+        """Live/offline shared path: one closed 1m candle, synth book, no live L2."""
+        return build_from_kline(self, o, h, l, c, v)
 
     @staticmethod
     def _parse_depth(depth_evt, k=3):

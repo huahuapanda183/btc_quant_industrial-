@@ -86,6 +86,10 @@ class RiskController:
         self.eps = float(rc.get("eps", 1e-6))
         self._breakeven_armed = False
 
+        tcfg = cfg.get("trading") or {}
+        # Default false: freeze new opens / flips. TP/SL/timeout still emit exits.
+        self.allow_new_opens = bool(tcfg.get("allow_new_opens", False))
+
         self.state_path = f"{self.symbol}_risk.pkl"
         self._pending_exit = None  # (decision, reason) until the ledger fill lands
         self._book_side = None
@@ -361,6 +365,8 @@ class RiskController:
 
         # ===== 新开仓 / 反手（只决策，账本由 PaperBroker 平后开）=====
         if signal != "HOLD" and signal != self.position:
+            if not self.allow_new_opens:
+                return "HOLD", "opens_frozen"
             return signal, "open"
 
         return "HOLD", "no_change"

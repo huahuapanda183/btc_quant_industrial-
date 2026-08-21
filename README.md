@@ -14,6 +14,7 @@
 ### 数据与模型
 - 行情源：`market.provider: okx`（已兼容受限地区场景）
 - 特征：`modules/features.py` 统一 12 维特征
+- **线上推理与离线训练同一条 FeatureBuilder 路径**：只在 *已收盘* 的 1m K 线上 `update_closed_kline` / `build_from_kline`（与 `get_train_data.py` 回放一致）。`seq_len=30` 是 30 分钟，不是 30 笔成交。形成中的分钟不做推理。live L2 / MM 快照可以给门控，但 **不得** 进入 `predict()` 的 12 维序列。
 - 模型：TFT + NBeats（`model_definitions.py`）
 - 推理管理：`modules/model.py`
   - 支持 scaler 加载
@@ -165,6 +166,7 @@ python3 scripts/system_health_report.py
 - `low_vol.*`
 - `mm.*`（score_open/score_force/gate_mode）
 - `trading.mode`: 建议长期 `paper`
+- `trading.allow_new_opens`: **默认 false**。分类头 `p` 尚未从 0/1 饱和中恢复前，禁止用 `p` 开仓或反手；TP/SL/timeout/fast_take/breakeven 仍走唯一的 `PaperBroker` 账本。
 
 ### `thresholds.json`
 - `temp.tft / temp.nbt`
@@ -182,6 +184,8 @@ python3 scripts/system_health_report.py
 4. **Cut 1 不声称 live alpha。** 分类头让 `avg_prob≈0.5` 不再是「近零收益残差 + sigmoid」的代数恒等式；它若仍在 0.5 附近，那是数据/可分性问题，不是旧头的必然输出。
 5. 纸面只有一本仓：`PaperBroker`。反手先 CLOSE（记净盈亏）再 OPEN。`PhaseSim` 只报告，不再自开第三本仓。`RiskController` 未绑定 `position_view` 时只读 / 无仓，**不会**把本地 pickle 当成成交账本。
 6. 标签窗口只有 `label.horizon_minutes`（时钟）。已删除可训练的 `future_shift` 成交笔数位移。
+7. **线上推理 = 1m 收盘 FeatureBuilder，与 train 相同。** 不要在 tick + live book 上 `predict()`。`p` 在仍贴 0/1（或无法校准）之前 **不是验收指标**；不要追胜率，也不要为此改 TP/SL / κ / `horizon_minutes`。
+8. `trading.allow_new_opens` 默认关闭。本切冻结新开仓；平仓必须仍进 `PaperBroker`。
 
 ---
 

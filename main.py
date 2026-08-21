@@ -18,10 +18,11 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from modules.collector import BinanceCollector
 from modules.features import FeatureBuilder
+from modules.bars import ClosedBarClock, ClosedBar, fetch_recent_closed_klines
 from modules.model import ModelManager, UncalibratedWeightsError
 from modules.push import PushManager
 from modules.signal import SignalFusion
-from modules.risk import RiskController
+from modules.risk import RiskController, EXIT_REASONS
 from modules.executor import TradeExecutor  # 需要 ob_getter
 from modules.midtrend import MidTrend  # 中期模块
 
@@ -70,6 +71,8 @@ INFER_COOLDOWN = float(CONFIG.get("infer_cooldown_sec", 0.0 if not LOW_GPU_MODE 
 # 交易相关（给 MM 传费率等）
 TRADING_CFG = CONFIG.get("trading", {}) or {}
 TAKER_FEE_BP = float(TRADING_CFG.get("taker_fee_bp", 2.0))  # 默认 2bps
+# Strategy freeze: p must not size or flip. Default false. Exits still fill.
+ALLOW_NEW_OPENS = bool(TRADING_CFG.get("allow_new_opens", False))
 
 # ---- 交易所合约别名修正（例如 renderusdt -> RNDRUSDT）----
 ALIASES_EXCHANGE = {"renderusdt": "RNDRUSDT"}
@@ -351,9 +354,12 @@ class SymbolRunner:
         self.symbol = symbol.lower()
         self.collector = BinanceCollector(self.symbol, config=CONFIG)
         self.fb = FeatureBuilder(seq_len=SEQ_LEN)
+        self.bar_clock = ClosedBarClock()
         self.mm = ModelManager(self.symbol)
         self.sf = SignalFusion()
         self.executor = executor
+        self._last_prob: Optional[float] = None
+        self._last_diag: str = ""
         view = None
         if executor is not None:
             view = lambda: executor.paper.snapshot(self.symbol)
@@ -376,6 +382,25 @@ class SymbolRunner:
         self._swing_task: Optional[asyncio.Task] = None
         self._last_swing_bar: Optional[int] = None
         self._last_swing_side: Optional[str] = None
+
+    def _warmup_closed_bars(self):
+        """Replay recent *closed* 1m klines through FeatureBuilder (same as train)."""
+        try:
+            bars = fetch_recent_closed_klines(CONFIG, self.symbol, limit=max(SEQ_LEN + 10, 60))
+        except Exception as e:
+            self.logger.warning(f"[{self.symbol}] closed-bar warmup fetch failed: {e}")
+            return
+        n = 0
+        for bar in bars:
+            emitted = self.bar_clock.ingest_kline(
+                bar.open_ts_ms, bar.open, bar.high, bar.low, bar.close, bar.volume, closed=True
+            )
+            if emitted is None:
+                continue
+            self.fb.update_closed_kline(emitted.open, emitted.high, emitted.low, emitted.close, emitted.volume)
+            self._append_close(emitted.close)
+            n += 1
+        self.logger.info(f"[{self.symbol}] FeatureBuilder warmup: {n} closed 1m klines (seq_len={SEQ_LEN})")
 
     def _append_close(self, price: float):
         try:
@@ -530,140 +555,165 @@ class SymbolRunner:
                 self.logger.error(f"[{self.symbol}] SWING 异常: {e}")
             await asyncio.sleep(poll)
 
+    def _on_closed_bar(self, bar: ClosedBar):
+        """One closed 1m candle → one FeatureBuilder row (offline-identical). No live book."""
+        return self.fb.update_closed_kline(bar.open, bar.high, bar.low, bar.close, bar.volume)
+
+    def _maybe_emit_closed_from_kline(self, kline: dict) -> Optional[ClosedBar]:
+        return self.bar_clock.ingest_kline_msg(kline)
+
+    def _maybe_emit_closed_from_trade(self, ts_ms: int, price: float, qty: float) -> Optional[ClosedBar]:
+        return self.bar_clock.ingest_trade(ts_ms, price, qty)
+
+    def _trade_for_risk(self, price, prob=None, diag=None) -> dict:
+        return {
+            "symbol": self.symbol,
+            "p": float(price) if price is not None else None,
+            "close": list(self._closes) if len(self._closes) else None,
+            "p_hat_prob": float(prob if prob is not None else (self._last_prob or 0.0)),
+            "p_min": getattr(self.sf, "p_min", 0.0),
+            "reason_text": diag if diag is not None else self._last_diag,
+        }
+
+    async def _maybe_manage_exits(self, price):
+        """Tick path: TP/SL/timeout/fast_take/breakeven only. Does not infer or open."""
+        if price is None or not self.risk.in_position():
+            return
+        trade_for_risk = self._trade_for_risk(price)
+        decision, reason = self.risk.judge("HOLD", trade_for_risk)
+        if decision in ("BUY", "SELL") and reason in EXIT_REASONS:
+            self.logger.info(f"[{self.symbol}] exit-on-tick decision={decision} reason={reason}")
+            self._exec_and_sync(decision, reason, price)
+
+    async def _infer_on_closed_bar(self, bar: ClosedBar):
+        """Closed-1m infer. Feature vector is FeatureBuilder-only; MM book stays out of seq."""
+        seq = self._on_closed_bar(bar)
+        if seq is None or (hasattr(seq, "__len__") and len(seq) == 0):
+            return
+        self._append_close(bar.close)
+        PRICE_CACHE[self.symbol] = float(bar.close)
+
+        if INFER_COOLDOWN > 0:
+            now_cool = time.time()
+            if now_cool - self._last_infer_ts < INFER_COOLDOWN:
+                return
+            self._last_infer_ts = now_cool
+
+        try:
+            label, prob = self.mm.predict(seq)
+        except UncalibratedWeightsError as e:
+            self.logger.error(f"[{self.symbol}] infer refused (not P(up)): {e}")
+            return
+        self._last_prob = float(prob)
+        self.logger.info(f"[{self.symbol}] closed_1m infer prob={prob:.3f} label={label} bar_ts={bar.open_ts_ms}")
+
+        # Live L2 is MM/gating only — not part of the 12-d predict() sequence.
+        book_snapshot, last_q_ms, d_spread_dt_bp, now_ms = self.collector.get_orderbook_ctx()
+
+        last_feat = np.asarray(seq)[-1]
+        vol_abs = float(last_feat[6]) if len(last_feat) > 6 else 0.0
+        vol_regime = max(0.0, min(1.0, vol_abs / 0.2)) if vol_abs > 0 else 0.5
+
+        fused_signal, diag, phase_evt = self.sf.fuse(
+            label, seq, prob,
+            book_snapshot=book_snapshot,
+            now_ts_ms=now_ms,
+            last_quote_change_ms=last_q_ms,
+            fee_taker_bp=TAKER_FEE_BP,
+            d_spread_dt_bp=d_spread_dt_bp,
+            asr_flag=False,
+            vwap_bias=0.0,
+            vol_regime=vol_regime,
+            closes=list(self._closes)
+        )
+        self._last_diag = diag or ""
+        self.logger.info(f"[{self.symbol}] fused_signal={fused_signal} | {diag}")
+
+        if isinstance(phase_evt, dict):
+            self._push_phase_event(phase_evt)
+
+        mm_cfg = CONFIG.get("mm", {}) or {}
+        env_str, gate_reject = build_env_and_gate(diag or "", mm_cfg)
+        model_line = format_model_confirm(diag or "", {
+            "score_open": mm_cfg.get("score_open", 0.62),
+            "score_force": mm_cfg.get("score_force", 0.52),
+            "score_open_low_vol": mm_cfg.get("score_open_low_vol", mm_cfg.get("score_open", 0.62)),
+            "score_force_low_vol": mm_cfg.get("score_force_low_vol", mm_cfg.get("score_force", 0.52)),
+        })
+        price = float(bar.close)
+        trade_for_risk = self._trade_for_risk(price, prob, diag)
+
+        if gate_reject:
+            if self.risk.in_position():
+                decision, reason = self.risk.judge("HOLD", trade_for_risk)
+                self.logger.info(f"[{self.symbol}] gate_reject risk_check decision={decision} reason={reason}")
+                if decision in ("BUY", "SELL") and reason in EXIT_REASONS:
+                    await self._maybe_push(decision, trade_for_risk, prob,
+                                           hint=diag, fused_signal=fused_signal, reason=reason,
+                                           env_str=env_str, model_line=model_line)
+                    self._exec_and_sync(decision, reason, price)
+                    return
+            await self._maybe_push("HOLD@filtered", {"p": price}, prob,
+                                   fused_signal=fused_signal, reason="filtered",
+                                   env_str=env_str, model_line=model_line)
+            return
+
+        if not self._confirm_signal(fused_signal, prob, CONFIRM_MAX_GAP,
+                                    CONFIRM_NEED_PROB_LOW_VOL if "低波动" in env_str else CONFIRM_NEED_PROB):
+            if self.risk.in_position():
+                decision, reason = self.risk.judge("HOLD", trade_for_risk)
+                if decision in ("BUY", "SELL") and reason in EXIT_REASONS:
+                    self._exec_and_sync(decision, reason, price)
+            return
+
+        decision, reason = self.risk.judge(fused_signal, trade_for_risk)
+        self.logger.info(f"[{self.symbol}] decision={decision} reason={reason}")
+        if decision not in ("BUY", "SELL"):
+            await self._maybe_push(f"HOLD@{reason or 'no_change'}", trade_for_risk, prob,
+                                   fused_signal=fused_signal, reason=reason, env_str=env_str, model_line=model_line)
+            return
+
+        await self._maybe_push(decision, trade_for_risk, prob,
+                               hint=diag, fused_signal=fused_signal, reason=reason,
+                               env_str=env_str, model_line=model_line)
+        self._exec_and_sync(decision, reason, price)
+
     async def start(self):
-        self.logger.info(f"[{self.symbol}] Runner 已启动")
+        self.logger.info(
+            f"[{self.symbol}] Runner 已启动 | infer=closed_1m FeatureBuilder "
+            f"(same as get_train_data) | allow_new_opens={ALLOW_NEW_OPENS}"
+        )
+        self._warmup_closed_bars()
         asyncio.create_task(self.collector.start())
-        # 启动SWING循环
         self._swing_task = asyncio.create_task(self._swing_loop())
 
         try:
-            async for trade, depth in self.collector.stream():
+            async for trade, depth, kline in self.collector.stream():
                 if depth:
                     bb, ba = _extract_best_from_depth(depth)
                     if bb and ba:
                         OB_CACHE[self.symbol] = (bb, ba)
                         self._last_depth = depth
 
-                if not trade:
-                    continue
+                if trade:
+                    payload = trade.get("data", trade)
+                    price = payload.get("p") or payload.get("price")
+                    qty = payload.get("q") or payload.get("quantity") or 0.0
+                    ts_ms = payload.get("T") or payload.get("E") or int(time.time() * 1000)
+                    if price is not None:
+                        PRICE_CACHE[self.symbol] = float(price)
+                        SIM.on_tick(self.symbol, float(price), time.time())
+                        await self._maybe_manage_exits(price)
+                        closed_from_trade = self._maybe_emit_closed_from_trade(
+                            int(ts_ms), float(price), float(qty or 0.0)
+                        )
+                        if closed_from_trade is not None:
+                            await self._infer_on_closed_bar(closed_from_trade)
 
-                payload = trade.get("data", trade)
-                price = payload.get("p") or payload.get("price")
-                if price is not None:
-                    PRICE_CACHE[self.symbol] = float(price)
-                    self._append_close(price)
-                    SIM.on_tick(self.symbol, float(price), time.time())
-
-                seq = self.fb.build(trade, self._last_depth)
-                if seq is None or (hasattr(seq, "__len__") and len(seq) == 0):
-                    continue
-
-                if INFER_COOLDOWN > 0:
-                    now_cool = time.time()
-                    if now_cool - self._last_infer_ts < INFER_COOLDOWN:
-                        continue
-                    self._last_infer_ts = now_cool
-
-                try:
-                    label, prob = self.mm.predict(seq)
-                except UncalibratedWeightsError as e:
-                    # Fail closed: leftover MSE weights are not P(up). Cannot open.
-                    self.logger.error(f"[{self.symbol}] infer refused (not P(up)): {e}")
-                    continue
-                self.logger.info(f"[{self.symbol}] prob={prob:.3f} label={label}")
-
-                book_snapshot, last_q_ms, d_spread_dt_bp, now_ms = self.collector.get_orderbook_ctx()
-
-                last_feat = np.asarray(seq)[-1]
-                vol_abs = float(last_feat[6]) if len(last_feat) > 6 else 0.0
-                vol_regime = max(0.0, min(1.0, vol_abs / 0.2)) if vol_abs > 0 else 0.5
-
-                fused_signal, diag, phase_evt = self.sf.fuse(
-                    label, seq, prob,
-                    book_snapshot=book_snapshot,
-                    now_ts_ms=now_ms,
-                    last_quote_change_ms=last_q_ms,
-                    fee_taker_bp=TAKER_FEE_BP,
-                    d_spread_dt_bp=d_spread_dt_bp,
-                    asr_flag=False,
-                    vwap_bias=0.0,
-                    vol_regime=vol_regime,
-                    closes=list(self._closes)
-                )
-                self.logger.info(f"[{self.symbol}] fused_signal={fused_signal} | {diag}")
-
-                # 阶段性事件推送 & 模拟
-                if isinstance(phase_evt, dict):
-                    self._push_phase_event(phase_evt)
-
-                # 统一门控：先看是否允许执行（观点与执行分离）
-                mm_cfg = CONFIG.get("mm", {}) or {}
-                env_str, gate_reject = build_env_and_gate(diag or "", mm_cfg)
-                model_line = format_model_confirm(diag or "", {
-                    "score_open": mm_cfg.get("score_open", 0.62),
-                    "score_force": mm_cfg.get("score_force", 0.52),
-                    "score_open_low_vol": mm_cfg.get("score_open_low_vol", mm_cfg.get("score_open", 0.62)),
-                    "score_force_low_vol": mm_cfg.get("score_force_low_vol", mm_cfg.get("score_force", 0.52)),
-                })
-
-                # 如果门控拒绝：不开新仓，但已持仓时仍允许风控检查平仓（TP/SL/超时等）
-                if gate_reject:
-                    if prob is None:
-                        continue
-
-                    # 若当前已有仓位，优先让风险模块做持仓管理，避免“只开不平”
-                    in_pos = self.risk.in_position()
-                    if in_pos:
-                        trade_for_risk = {
-                            "symbol": self.symbol,
-                            "p": float(price) if price is not None else None,
-                            "close": list(self._closes) if len(self._closes) else None,
-                            "p_hat_prob": float(prob),
-                            "p_min": getattr(self.sf, "p_min", 0.0),
-                            "reason_text": diag
-                        }
-                        decision, reason = self.risk.judge("HOLD", trade_for_risk)
-                        self.logger.info(f"[{self.symbol}] gate_reject risk_check decision={decision} reason={reason}")
-                        if decision in ("BUY", "SELL"):
-                            await self._maybe_push(decision, trade_for_risk, prob,
-                                                   hint=diag, fused_signal=fused_signal, reason=reason,
-                                                   env_str=env_str, model_line=model_line)
-                            self._exec_and_sync(decision, reason, price)
-                            continue
-
-                    await self._maybe_push("HOLD@filtered", {
-                        "p": float(price) if price is not None else None
-                    }, prob, fused_signal=fused_signal, reason="filtered", env_str=env_str, model_line=model_line)
-                    continue
-
-                # 双确认
-                if not self._confirm_signal(fused_signal, prob, CONFIRM_MAX_GAP,
-                                            CONFIRM_NEED_PROB_LOW_VOL if "低波动" in env_str else CONFIRM_NEED_PROB):
-                    continue
-
-                # 进入风控裁决
-                trade_for_risk = {
-                    "symbol": self.symbol,
-                    "p": float(price) if price is not None else None,
-                    "close": list(self._closes) if len(self._closes) else None,
-                    "p_hat_prob": float(prob),
-                    "p_min": getattr(self.sf, "p_min", 0.0),
-                    "reason_text": diag
-                }
-                decision, reason = self.risk.judge(fused_signal, trade_for_risk)
-                self.logger.info(f"[{self.symbol}] decision={decision} reason={reason}")
-                if decision not in ("BUY", "SELL"):
-                    # 非买卖也给出“模型观点 + 环境”但不强推
-                    await self._maybe_push(f"HOLD@{reason or 'no_change'}", trade_for_risk, prob,
-                                           fused_signal=fused_signal, reason=reason, env_str=env_str, model_line=model_line)
-                    continue
-
-                # 推送 + 执行
-                await self._maybe_push(decision, trade_for_risk, prob,
-                                       hint=diag, fused_signal=fused_signal, reason=reason,
-                                       env_str=env_str, model_line=model_line)
-
-                self._exec_and_sync(decision, reason, price)
+                if kline:
+                    closed = self._maybe_emit_closed_from_kline(kline)
+                    if closed is not None:
+                        await self._infer_on_closed_bar(closed)
 
         except asyncio.CancelledError:
             self.logger.info(f"[{self.symbol}] 收到取消信号，准备退出 …")
@@ -676,6 +726,10 @@ class SymbolRunner:
     def _exec_and_sync(self, decision, reason, price):
         if not self.executor:
             return None
+        is_exit = reason in EXIT_REASONS
+        if (not is_exit) and (not ALLOW_NEW_OPENS):
+            self.logger.info(f"[{self.symbol}] open frozen (allow_new_opens=false) decision={decision} reason={reason}")
+            return {"status": "SKIP", "info": "allow_new_opens=false"}
         exec_resp = self.executor.execute(self.symbol, decision, reason)
         self.logger.info(f"[{self.symbol}] EXEC {exec_resp}")
         if exec_resp and exec_resp.get("status") == "FILLED":
@@ -746,6 +800,8 @@ async def main():
         logger.info("未检测到 GPU，使用 CPU 多线程")
 
     logger.info(f"=== 启动 {len(SYMBOLS)} 个交易对: {', '.join(SYMBOLS)} ===")
+    logger.info("live infer: closed 1m FeatureBuilder (same path as get_train_data replay); p is not an acceptance metric while stuck at 0/1")
+    logger.info(f"allow_new_opens={ALLOW_NEW_OPENS} (exits still go through PaperBroker)")
     logger.info(f"低算力模式: {'ON' if LOW_GPU_MODE else 'OFF'}，推理冷却: {INFER_COOLDOWN:.2f}s")
     logger.info(f"最小推送间隔: {MIN_PUSH_INTERVAL}s, 双确认: need_prob={CONFIRM_NEED_PROB}, max_gap={CONFIRM_MAX_GAP}s")
 

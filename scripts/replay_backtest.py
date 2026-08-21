@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules.features import FeatureBuilder
+from modules.features import FeatureBuilder, build_from_kline
 from modules.model import ModelManager
 
 
@@ -41,13 +41,7 @@ def main():
     closes = [x[4] for x in kl]
 
     for i, (_, o, h, l, c, v) in enumerate(kl):
-        # 伪造与线上一致事件结构（无L2时用近似）
-        spread = max((h - l) * 0.05, c * 0.00015)
-        bid = c - spread / 2
-        ask = c + spread / 2
-        depth_evt = {"b": [[str(bid), str(max(v * 0.5, 1.0))]], "a": [[str(ask), str(max(v * 0.5, 1.0))]]}
-        trade_evt = {"p": str(c), "q": str(max(v * 0.1, 1.0)), "m": False}
-        seq = fb.build(trade_evt, depth_evt)
+        seq = build_from_kline(fb, o, h, l, c, v)
         if seq is None:
             continue
 
