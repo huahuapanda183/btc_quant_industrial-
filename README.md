@@ -85,18 +85,30 @@ sudo docker compose stop btc-quant
 
 ---
 
-## 4. 训练（干净重训流程）
+## 4. 训练（分类头，干净重训）
+
+目标是 **方向分类**，不是回归未来收益后再 `sigmoid` 当买概率。
+
+- 时钟窗口：`label.horizon_minutes`（默认 20，位于 15–30 分钟带；**15 / 30 / 60 可扫，不是宣称最优**）
+- 死区 κ：默认 `2 * (trading.taker_fee_bp + slippage_bp) / 1e4 + label.dead_zone`
+- 损失：`BCEWithLogitsLoss`；温度 T 在 **时间持出 + purge/embargo** 的验证段上拟合（Guo 2017）
+- `get_train_data.py` 只构建与 FeatureBuilder 对齐的数据集，**不再写 scaler.pkl**
 
 ```bash
 cd /home/huahuapanda183/apps/btc_quant_industrial-
-rm -f tft_model.pth nbeats_model.pth scaler.pkl thresholds.json
+rm -f tft_model.pth nbeats_model.pth scaler.pkl model_meta.json
+# 离线（K 线回放 FeatureBuilder 12-d + 时钟标签）
+sudo docker compose run --rm btc-quant python get_train_data.py
+sudo docker compose run --rm btc-quant python train_models.py --offline train_data.npz
+# 或实时成交流（标签要等满 horizon 分钟才出现）
 sudo docker compose run --rm btc-quant python train_models.py
 ```
 
 训练稳定后会生成：
-- `tft_model.pth`
-- `nbeats_model.pth`
-- `scaler.pkl`
+- `tft_model.pth` / `nbeats_model.pth`（分类 logit 头，架构未改）
+- `scaler.pkl`（12-d FeatureBuilder，仅 trainer 写）
+- `model_meta.json`（horizon / κ / 概率含义）
+- `thresholds.json` 的 `temp.tft` / `temp.nbt`
 
 ---
 
@@ -165,6 +177,8 @@ python3 scripts/system_health_report.py
 1. `live` 执行仍未接交易所真实下单 SDK（当前主流程是 paper）。
 2. 低波动行情下，策略可能仍偏保守，需要持续调优 `mm + p_min + low_vol`。
 3. 胜率/PNL 依赖 `paper_trades.jsonl` 的成交闭环，不应只看信号数量。
+4. **Cut 1 不声称 live alpha。** 分类头让 `avg_prob≈0.5` 不再是「近零收益残差 + sigmoid」的代数恒等式；它若仍在 0.5 附近，那是数据/可分性问题，不是旧头的必然输出。
+5. 纸面只有一本仓：`PaperBroker`。反手先 CLOSE（记净盈亏）再 OPEN。`PhaseSim` 只报告，不再自开第三本仓。
 
 ---
 

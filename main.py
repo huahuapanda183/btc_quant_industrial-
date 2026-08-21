@@ -273,38 +273,23 @@ def format_model_confirm(diag: str, cfg: dict) -> str:
 
 
 # =========================
-# 模拟器：PhaseSim（保持不变）
+# PhaseSim：账本视图 / 报告器（不再自开第三本仓）
 # =========================
 class PhaseSim:
-    """
-    规则（与推送一致）：
-      - bottom(做多)：到 T1 实现 40%，SL 抬至保本；到 T2 再 40%，启用追踪止盈（k×ATR%）；余下 20% 走 T3 或追踪止损。
-      - top(做空)：镜像逻辑。
-      - 费用：用 trading.taker_fee_bp 与 slippage_bp 粗估（双边）。
+    """Reporter on the paper ledger. Does not open or flatten positions.
+
+    Phase / swing text is still pushed as a *recommendation*. Fills and PnL
+    live only on PaperBroker (bound via bind_ledger).
     """
     def __init__(self, cfg: dict, pusher_obj=None):
         self.cfg = cfg
-        self.ps: List[dict] = []
-        self.closed: List[dict] = []
         self.pusher = pusher_obj
-        tcfg = cfg.get("trading", {}) or {}
-        self.fee_bp = float(tcfg.get("taker_fee_bp", 0.5))
-        self.slip_bp = float(tcfg.get("slippage_bp", 0.0))
-        self.partials = cfg.get("sim", {}).get("partials", [0.4, 0.4, 0.2])
-        self.reverse_guard_s = int(cfg.get("risk", {}).get("reverse_guard_seconds", 240))
+        self.ledger = None
+        self._last_report_ts: Dict[str, float] = {}
+        self.resend_sec = float((cfg.get("sim") or {}).get("resend_updates_sec", 60))
 
-        self._last_open_side: Dict[str, str] = {}
-        self._last_open_ts: Dict[str, float] = {}
-
-        self._daily_ymd = None
-        self._daily = {"n": 0, "win": 0, "gross_bp": 0.0, "net_bp": 0.0}
-
-    @staticmethod
-    def _now_ts():
-        return time.time()
-
-    def _fees_roundtrip_bp(self):
-        return 2.0 * (self.fee_bp + self.slip_bp)
+    def bind_ledger(self, ledger):
+        self.ledger = ledger
 
     def _push(self, text: str):
         logging.getLogger("SIM").info(text)
@@ -318,197 +303,41 @@ class PhaseSim:
                 logging.getLogger("SIM").error(f"[SIM] 推送失败: {e}")
 
     def open_from_phase(self, symbol: str, phase: dict):
+        """Push a phase recommendation only — never a second fill book."""
         try:
             side = "LONG" if str(phase.get("kind")).lower() == "bottom" else "SHORT"
             px = float(phase["price"])
             t1 = float(phase["t1"]); t2 = float(phase["t2"]); t3 = float(phase["t3"])
             sl = float(phase["sl"])
             conf = float(phase.get("conf", 0.0))
-            atr_pct = float(phase.get("atr_pct", 0.006))
-            trail_k = float(phase.get("trail_k", self.cfg.get("phase", {}).get("trail_k_atr", 0.6)))
-
-            sym = symbol.lower()
-            last_side = self._last_open_side.get(sym)
-            last_ts = float(self._last_open_ts.get(sym, 0.0))
-            now_ts = self._now_ts()
-
-            if last_side and last_side != side and (now_ts - last_ts) < self.reverse_guard_s:
-                self._push(f"【SIM】{symbol.upper()} | 忽略反手信号（{int(self.reverse_guard_s)}s 护栏）")
-                return
-            if last_side == side and (now_ts - last_ts) < 30:
-                self._push(f"【SIM】{symbol.upper()} | 忽略 30s 内同向重复开仓")
-                return
-
-            trade = {
-                "id": f"{symbol}-{int(now_ts*1000)}",
-                "symbol": symbol,
-                "side": side,
-                "entry": px,
-                "t1": t1, "t2": t2, "t3": t3,
-                "sl": sl, "trail_k": trail_k, "atr_pct": atr_pct,
-                "conf": conf,
-                "opened_at": now_ts,
-                "status": "OPEN",
-                "hit": {"t1": False, "t2": False, "t3": False},
-                "trail_stop": None,
-                "realized_bp": 0.0,
-                "realized_frac": 0.0,
-                "last_report_ts": 0.0
-            }
-            self.ps.append(trade)
-            self._last_open_side[sym] = side
-            self._last_open_ts[sym] = now_ts
-
-            text = (f"【SIM】开仓 | {symbol.upper()} | {side} | 入场:{px:g} | "
-                    f"T1:{t1:g} T2:{t2:g} T3:{t3:g} | SL:{sl:g} | 置信:{conf:.2f} | trail≈{trail_k}×ATR")
-            self._push(text)
+            book = ""
+            if self.ledger is not None:
+                snap = self.ledger.snapshot(symbol)
+                book = f" | 账本:{snap.get('side')}@{snap.get('entry') or '—'}"
+            self._push(
+                f"【SIM】相位建议（不入账）| {symbol.upper()} | {side} | 参考价:{px:g} | "
+                f"T1:{t1:g} T2:{t2:g} T3:{t3:g} | SL:{sl:g} | 置信:{conf:.2f}{book}"
+            )
         except Exception as e:
             logging.getLogger("SIM").error(f"[SIM] open_from_phase 异常: {e}")
 
-    @staticmethod
-    def _bp_from(px_a: float, px_b: float) -> float:
-        return (px_a - px_b) / max(px_b, 1e-12) * 1e4
-
-    def _update_one(self, tr: dict, price: float, now_ts: float):
-        if tr["status"] != "OPEN":
-            return
-        side = tr["side"]
-        entry = tr["entry"]
-        atr_pct = tr["atr_pct"]
-        k = tr["trail_k"]
-
-        def is_up(x):   return price >= x
-        def is_dn(x):   return price <= x
-
-        hit_T1 = hit_T2 = hit_T3 = hit_SL = hit_Trail = False
-        fill_msgs = []
-
-        if side == "LONG":
-            if (not tr["hit"]["t1"]) and is_up(tr["t1"]):
-                tr["hit"]["t1"] = True; hit_T1 = True
-                frac = SIM_CFG.get("partials", [0.4, 0.4, 0.2])[0]
-                pnl_bp = self._bp_from(price, entry) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] += frac
-                tr["sl"] = max(tr["sl"], entry)
-                fill_msgs.append(f"T1 触发 | 成交:{price:g} (+{self._bp_from(price, entry):.2f}bp) | 实现 {int(frac*100)}% | SL抬至保本")
-            if (not tr["hit"]["t2"]) and is_up(tr["t2"]):
-                tr["hit"]["t2"] = True; hit_T2 = True
-                frac = SIM_CFG.get("partials", [0.4, 0.4, 0.2])[1]
-                pnl_bp = self._bp_from(price, entry) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] += frac
-                trail = price * (1.0 - k * atr_pct)
-                tr["trail_stop"] = max(tr.get("trail_stop") or -1e18, trail)
-                fill_msgs.append(f"T2 触发 | 成交:{price:g} (+{self._bp_from(price, entry):.2f}bp) | 实现 {int(frac*100)}% | 启用追踪止盈≈{k}×ATR")
-            if tr["hit"]["t2"]:
-                trail = price * (1.0 - k * atr_pct)
-                tr["trail_stop"] = max(tr.get("trail_stop") or -1e18, trail)
-
-            if (not tr["hit"]["t3"]) and is_up(tr["t3"]):
-                tr["hit"]["t3"] = True; hit_T3 = True
-                frac = 1.0 - tr["realized_frac"]
-                pnl_bp = self._bp_from(price, entry) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] = 1.0
-                fill_msgs.append(f"T3 触发 | 成交:{price:g} (+{self._bp_from(price, entry):.2f}bp) | 全部平仓")
-            else:
-                if tr.get("trail_stop") is not None and price <= tr["trail_stop"] and tr["realized_frac"] < 1.0:
-                    frac = 1.0 - tr["realized_frac"]
-                    pnl_bp = self._bp_from(tr["trail_stop"], entry) * frac
-                    tr["realized_bp"] += pnl_bp
-                    tr["realized_frac"] = 1.0
-                    hit_Trail = True
-                    fill_msgs.append(f"追踪止盈触发 | 成交:{tr['trail_stop']:g} (+{self._bp_from(tr['trail_stop'], entry):.2f}bp) | 全部平仓")
-                if price <= tr["sl"] and tr["realized_frac"] < 1.0:
-                    frac = 1.0 - tr["realized_frac"]
-                    pnl_bp = self._bp_from(tr["sl"], entry) * frac
-                    tr["realized_bp"] += pnl_bp
-                    tr["realized_frac"] = 1.0
-                    hit_SL = True
-                    fill_msgs.append(f"止损触发 | 成交:{tr['sl']:g} ({self._bp_from(tr['sl'], entry):.2f}bp) | 全部平仓")
-        else:
-            if (not tr["hit"]["t1"]) and is_dn(tr["t1"]):
-                tr["hit"]["t1"] = True; hit_T1 = True
-                frac = SIM_CFG.get("partials", [0.4, 0.4, 0.2])[0]
-                pnl_bp = self._bp_from(entry, price) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] += frac
-                tr["sl"] = min(tr["sl"], entry)
-                fill_msgs.append(f"T1 触发 | 成交:{price:g} (+{self._bp_from(entry, price):.2f}bp) | 实现 {int(frac*100)}% | SL下调至保本")
-            if (not tr["hit"]["t2"]) and is_dn(tr["t2"]):
-                tr["hit"]["t2"] = True; hit_T2 = True
-                frac = SIM_CFG.get("partials", [0.4, 0.4, 0.2])[1]
-                pnl_bp = self._bp_from(entry, price) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] += frac
-                trail = price * (1.0 + k * atr_pct)
-                tr["trail_stop"] = min(tr.get("trail_stop") or 1e18, trail)
-                fill_msgs.append(f"T2 触发 | 成交:{price:g} (+{self._bp_from(entry, price):.2f}bp) | 实现 {int(frac*100)}% | 启用追踪止盈≈{k}×ATR")
-            if tr["hit"]["t2"]:
-                trail = price * (1.0 + k * atr_pct)
-                tr["trail_stop"] = min(tr.get("trail_stop") or 1e18, trail)
-
-            if (not tr["hit"]["t3"]) and is_dn(tr["t3"]):
-                tr["hit"]["t3"] = True; hit_T3 = True
-                frac = 1.0 - tr["realized_frac"]
-                pnl_bp = self._bp_from(entry, price) * frac
-                tr["realized_bp"] += pnl_bp
-                tr["realized_frac"] = 1.0
-                fill_msgs.append(f"T3 触发 | 成交:{price:g} (+{self._bp_from(entry, price):.2f}bp) | 全部平仓")
-            else:
-                if tr.get("trail_stop") is not None and price >= tr["trail_stop"] and tr["realized_frac"] < 1.0:
-                    frac = 1.0 - tr["realized_frac"]
-                    pnl_bp = self._bp_from(entry, tr["trail_stop"]) * frac
-                    tr["realized_bp"] += pnl_bp
-                    tr["realized_frac"] = 1.0
-                    hit_Trail = True
-                    fill_msgs.append(f"追踪止盈触发 | 成交:{tr['trail_stop']:g} (+{self._bp_from(entry, tr['trail_stop']):.2f}bp) | 全部平仓")
-                if price >= tr["sl"] and tr["realized_frac"] < 1.0:
-                    frac = 1.0 - tr["realized_frac"]
-                    pnl_bp = self._bp_from(entry, tr["sl"]) * frac
-                    tr["realized_bp"] += pnl_bp
-                    tr["realized_frac"] = 1.0
-                    hit_SL = True
-                    fill_msgs.append(f"止损触发 | 成交:{tr['sl']:g} ({self._bp_from(entry, tr['sl']):.2f}bp) | 全部平仓")
-
-        if fill_msgs:
-            self._push("【SIM】" + tr["symbol"].upper() + " | " + " / ".join(fill_msgs))
-
-        if tr["realized_frac"] >= 1.0:
-            fees_bp = self._fees_roundtrip_bp()
-            net_bp = tr["realized_bp"] - fees_bp
-            tr["status"] = "CLOSED"
-            tr["closed_at"] = now_ts
-            tr["gross_bp"] = tr["realized_bp"]
-            tr["net_bp"] = net_bp
-            self.closed.append(tr)
-            self.ps = [x for x in self.ps if x["id"] != tr["id"]]
-
-            win = 1 if net_bp > 0 else 0
-            ymd = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
-            if self._daily_ymd != ymd:
-                self._daily_ymd = ymd
-                self._daily = {"n": 0, "win": 0, "gross_bp": 0.0, "net_bp": 0.0}
-            self._daily["n"] += 1
-            self._daily["win"] += win
-            self._daily["gross_bp"] += tr["gross_bp"]
-            self._daily["net_bp"] += tr["net_bp"]
-
-            wr = (self._daily["win"] / max(1, self._daily["n"])) * 100.0
-            self._push(
-                f"【SIM】平仓总结 | {tr['symbol'].upper()} | {tr['side']} | 毛:{tr['gross_bp']:.2f}bp "
-                f"净:{tr['net_bp']:.2f}bp(扣费≈{fees_bp:.2f}bp) | 当日：{self._daily['n']}笔 胜率:{wr:.1f}% 净:{self._daily['net_bp']:.2f}bp"
-            )
-
     def on_tick(self, symbol: str, price: float, ts: float = None):
-        if not SIM_CFG.get("enable", True):
+        if not SIM_CFG.get("enable", True) or self.ledger is None:
             return
-        ts = ts or self._now_ts()
-        for tr in list(self.ps):
-            if tr["symbol"].lower() != symbol.lower():
-                continue
-            self._update_one(tr, float(price), ts)
+        ts = ts or time.time()
+        last = self._last_report_ts.get(symbol.lower(), 0.0)
+        if ts - last < self.resend_sec:
+            return
+        snap = self.ledger.snapshot(symbol)
+        if snap.get("side") not in ("BUY", "SELL"):
+            return
+        self._last_report_ts[symbol.lower()] = ts
+        mtm = self.ledger.mark_to_market(symbol, float(price))
+        self._push(
+            f"【SIM】账本浮盈 | {symbol.upper()} | {snap['side']} qty={snap['qty']:.6f} "
+            f"入场:{snap['entry']:g} 现价:{float(price):g} mtm:{mtm:.4f} "
+            f"equity:{float(self.ledger.equity):.2f}"
+        )
 
 
 SIM = PhaseSim(CONFIG, pusher_obj=pusher)
@@ -518,13 +347,17 @@ class SymbolRunner:
     _push_seen: Dict[str, float] = {}
     _push_ttl_sec = 5.0
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, executor=None):
         self.symbol = symbol.lower()
         self.collector = BinanceCollector(self.symbol, config=CONFIG)
         self.fb = FeatureBuilder(seq_len=SEQ_LEN)
         self.mm = ModelManager(self.symbol)
         self.sf = SignalFusion()
-        self.risk = RiskController(self.symbol)
+        self.executor = executor
+        view = None
+        if executor is not None:
+            view = lambda: executor.paper.snapshot(self.symbol)
+        self.risk = RiskController(self.symbol, position_view=view)
 
         self._last_depth = None
         self._last_push_ts = 0.0
@@ -533,8 +366,6 @@ class SymbolRunner:
         self._closes = deque(maxlen=max(SEQ_LEN * 4, 200))
         self._sig_buf = deque(maxlen=3)
         self.logger = logging.getLogger(f"runner.{self.symbol}")
-
-        self.executor = None  # 由 main() 注入
 
         # 阶段性事件去重
         self._last_phase_ts: float = 0.0
@@ -776,7 +607,7 @@ class SymbolRunner:
                         continue
 
                     # 若当前已有仓位，优先让风险模块做持仓管理，避免“只开不平”
-                    in_pos = getattr(self.risk, "position", "HOLD") in ("BUY", "SELL")
+                    in_pos = self.risk.in_position()
                     if in_pos:
                         trade_for_risk = {
                             "symbol": self.symbol,
@@ -792,9 +623,7 @@ class SymbolRunner:
                             await self._maybe_push(decision, trade_for_risk, prob,
                                                    hint=diag, fused_signal=fused_signal, reason=reason,
                                                    env_str=env_str, model_line=model_line)
-                            if self.executor:
-                                exec_resp = self.executor.execute(self.symbol, decision, reason)
-                                self.logger.info(f"[{self.symbol}] EXEC {exec_resp}")
+                            self._exec_and_sync(decision, reason, price)
                             continue
 
                     await self._maybe_push("HOLD@filtered", {
@@ -829,9 +658,7 @@ class SymbolRunner:
                                        hint=diag, fused_signal=fused_signal, reason=reason,
                                        env_str=env_str, model_line=model_line)
 
-                if self.executor:
-                    exec_resp = self.executor.execute(self.symbol, decision, reason)
-                    self.logger.info(f"[{self.symbol}] EXEC {exec_resp}")
+                self._exec_and_sync(decision, reason, price)
 
         except asyncio.CancelledError:
             self.logger.info(f"[{self.symbol}] 收到取消信号，准备退出 …")
@@ -840,6 +667,18 @@ class SymbolRunner:
             self.logger.error(f"[{self.symbol}] 处理异常: {e}")
             traceback.print_exc()
             await asyncio.sleep(0.1)
+
+    def _exec_and_sync(self, decision, reason, price):
+        if not self.executor:
+            return None
+        exec_resp = self.executor.execute(self.symbol, decision, reason)
+        self.logger.info(f"[{self.symbol}] EXEC {exec_resp}")
+        if exec_resp and exec_resp.get("status") == "FILLED":
+            try:
+                self.risk.on_fill(decision, reason, float(price or 0.0), exec_resp)
+            except Exception as e:
+                self.logger.error(f"[{self.symbol}] risk.on_fill 失败: {e}")
+        return exec_resp
 
     async def _maybe_push(self, decision, trade_msg, prob,
                           hint="", fused_signal=None, reason="",
@@ -939,15 +778,13 @@ async def main():
     except Exception as e:
         logger.warning(f"[SWING] 配置打印失败: {e}")
 
-    runners = [SymbolRunner(sym) for sym in SYMBOLS]
-
     executor = TradeExecutor(
         CONFIG,
         price_getter=lambda s: PRICE_CACHE.get(s),
         ob_getter=lambda s: OB_CACHE.get(s)
     )
-    for r in runners:
-        r.executor = executor
+    SIM.bind_ledger(executor.paper)
+    runners = [SymbolRunner(sym, executor=executor) for sym in SYMBOLS]
 
     if pusher:
         try:

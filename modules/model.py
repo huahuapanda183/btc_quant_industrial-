@@ -78,6 +78,11 @@ def _sigmoid(x):
     x = np.clip(x, -50.0, 50.0)
     return 1.0 / (1.0 + np.exp(-x))
 
+
+def logits_to_calibrated_prob(z, T: float = 1.0) -> float:
+    """Guo 2017: p = σ(z / T) on a *classification* logit, not a return residual."""
+    return float(_sigmoid(float(z) / max(1e-6, float(T))))
+
 class _FallbackModel:
     """
     用少量技术因子给出保守概率：
@@ -111,12 +116,14 @@ class _FallbackModel:
 class ModelManager:
     """
     负责加载 scaler/温度/模型，并提供 predict(features_seq) -> (label, prob)
-    - 任一权重/文件缺失自动回退
-    - 特征维度不一致自动截断/补零
-    - 打统一运行平均日志
+
+    The head is a direction classifier. `prob` is P(up over the configured
+    clock horizon after temperature scaling). It is *not* σ(predicted return).
     """
     def __init__(self, symbol: str):
         self.symbol = str(symbol).lower()
+        self.head = "classification"
+        self.prob_meaning = "P(r_{t→t+h} > κ) after temperature scaling"
 
         # === 读取配置 ===
         cfg = {}
@@ -151,6 +158,22 @@ class ModelManager:
                     self.blend_b = float(b.get("b", self.blend_b))
             except Exception as e:
                 logger.warning(f"[ModelMgr] thresholds.json 读取失败: {e}")
+
+        self.model_meta = {}
+        if os.path.exists("model_meta.json"):
+            try:
+                self.model_meta = json.load(open("model_meta.json", "r")) or {}
+                self.head = str(self.model_meta.get("head", self.head))
+                self.prob_meaning = str(self.model_meta.get("prob_meaning", self.prob_meaning))
+            except Exception as e:
+                logger.warning(f"[ModelMgr] model_meta.json 读取失败: {e}")
+        if self.head != "classification":
+            logger.warning(
+                "[ModelMgr] model_meta.head=%s — predict() still applies σ(z/T). "
+                "Retrain with train_models.py so z is a classification logit, "
+                "otherwise avg_prob≈0.5 can be an algebraic identity of an MSE-return head.",
+                self.head,
+            )
 
         # === Scaler ===
         self.scaler = None
@@ -252,8 +275,7 @@ class ModelManager:
         if isinstance(y, (tuple, list)):
             y = y[0]
         z = float(np.array(y.detach().cpu()).ravel()[-1])
-        p = float(_sigmoid(z / max(1e-6, self.T_tft)))
-        return p
+        return logits_to_calibrated_prob(z, self.T_tft)
 
     @torch.no_grad()
     def _infer_nbeats(self, Xs: np.ndarray) -> float | None:
@@ -265,13 +287,14 @@ class ModelManager:
         if isinstance(y, (tuple, list)):
             y = y[0]
         z = float(np.array(y.detach().cpu()).ravel()[-1])
-        p = float(_sigmoid(z / max(1e-6, self.T_nbt)))
-        return p
+        return logits_to_calibrated_prob(z, self.T_nbt)
 
     def predict(self, features_seq: np.ndarray):
         """
         输入：features_seq (T,F)
         输出：(label:int{0,1}, prob:float)
+
+        prob is a calibrated class probability (P(up over horizon)), not σ(MSE return).
         """
         try:
             Xs = self._prep(features_seq)         # (T, F)
